@@ -158,7 +158,7 @@ First stop the foreground Hub cleanly with `Ctrl+C` so two instances cannot writ
 node scripts/render-unit.mjs --dir "$PWD" --user "$USER" --home "$HOME"
 ```
 
-systemd does not read interactive shell startup files. For a custom CLI path, authentication directory or PATH, copy `deploy/zhiwei.env.example` to `deploy/zhiwei.env`, fill in the actual absolute paths and run `chmod 600 deploy/zhiwei.env`. Available entries are `CODEX_CLI_PATH`, `CODEX_HOME` and `PATH`; omitted entries keep their defaults. Use `KEY=value`, without `export`, `$HOME` expansion or command substitution. The default unit optionally loads this file; select another location with `--env-file /absolute/path/zhiwei.env`. Rendering never creates or overwrites the environment file and does not copy credentials.
+systemd does not read interactive shell startup files. For a custom CLI path, authentication directory or PATH, copy `deploy/zhiwei.env.example` to `deploy/zhiwei.env`, fill in the actual absolute paths and run `chmod 600 deploy/zhiwei.env`. Available entries are `CODEX_CLI_PATH`, `CODEX_HOME` and `PATH`; omitted entries keep their defaults. Use `KEY=value`, without `export`, `$HOME` expansion or command substitution. The default unit optionally loads this file; select another location with `--service-env-file /absolute/path/zhiwei.env`. Rendering never creates or overwrites the environment file and does not copy credentials.
 
 Back in an administrator terminal with sudo access, install the service (paths below assume the dedicated user is `zhiwei`):
 

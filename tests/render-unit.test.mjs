@@ -22,18 +22,25 @@ test('unit keeps a persistent optional environment file without embedding local 
   assert.doesNotMatch(unit, /(?:CODEX_HOME|CODEX_CLI_PATH)=/);
 });
 
-test('systemd raw paths and quoted words preserve spaces, quotes, percent signs and backslashes', () => {
+test('systemd preserves raw path literals and encodes supported executable paths', () => {
   const unit = renderUnit(template, {
     ...options,
     dir: String.raw`/srv/50% "quoted"\directory @NODE@`,
     home: String.raw`/home/a "quote"\b%h`,
-    node: String.raw`/opt/$tools/50% "quoted"\node`,
+    node: '/opt/$tools/50% directory/node',
     envFile: '/etc/50% "quoted" @HOME_ENV@.env'
   });
   assert.ok(unit.includes(String.raw`WorkingDirectory=/srv/50%% "quoted"\directory @NODE@` + '\n'));
   assert.ok(unit.includes('EnvironmentFile=-/etc/50%% "quoted" @HOME_ENV@.env\n'));
   assert.ok(unit.includes(String.raw`Environment="HOME=/home/a \"quote\"\\b%%h"` + '\n'));
-  assert.ok(unit.includes(String.raw`ExecStart=:"/opt/$tools/50%% \"quoted\"\\node" src/server.js` + '\n'));
+  assert.ok(unit.includes('ExecStart=:"/opt/$tools/50%% directory/node" src/server.js\n'));
+});
+
+test('executable paths rejected by systemd are rejected before a unit can be written', () => {
+  for (const character of ['"', "'", '\\', '\n', '\x00', '\x7f']) {
+    assert.throws(() => renderUnit(template, { ...options, node: `/opt/a${character}b/node` }), /node/);
+  }
+  assert.throws(() => renderUnit(template, { ...options, node: '/opt/node/' }), /node.*结尾/);
 });
 
 test('ambiguous environment file paths and injected directives are rejected', () => {
@@ -53,7 +60,7 @@ test('environment example has no active assignments or embedded credentials', as
   for (const name of ['CODEX_CLI_PATH', 'CODEX_HOME', 'PATH']) assert.ok(example.includes(`# ${name}=`));
 });
 
-test('renderer CLI accepts --env-file and old options without launching a service', { skip: process.platform !== 'linux' }, async t => {
+test('renderer CLI accepts --service-env-file and old options without launching a service', { skip: process.platform !== 'linux' }, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'zhiwei-render-'));
   t.after(async () => {
     assert.ok(resolve(directory).startsWith(resolve(tmpdir()) + '/zhiwei-render-'));
@@ -64,7 +71,7 @@ test('renderer CLI accepts --env-file and old options without launching a servic
   const execute = promisify(execFile);
   await execute(process.execPath, [fileURLToPath(new URL('../scripts/render-unit.mjs', import.meta.url)),
     '--dir', directory, '--user', 'zhiwei', '--home', '/home/zhiwei', '--node', process.execPath,
-    '--out', output, '--env-file', envFile]);
+    '--out', output, '--service-env-file', envFile]);
   const unit = await readFile(output, 'utf8');
   assert.ok(unit.includes(`EnvironmentFile=-${envFile}\n`));
   await assert.rejects(readFile(envFile), { code: 'ENOENT' });
@@ -81,7 +88,11 @@ test('systemd parses the rendered special-character paths without starting a ser
   });
   const installDir = join(directory, '50% "quoted" $literal');
   await mkdir(installDir);
-  const executable = join(installDir, 'node');
+  // WorkingDirectory and EnvironmentFile can retain quotes literally, but the
+  // executable is subject to systemd's additional string_is_safe() restriction.
+  const executableDir = join(directory, 'node tools 50% $literal');
+  await mkdir(executableDir);
+  const executable = join(executableDir, 'node');
   await symlink(process.execPath, executable);
   const unit = renderUnit(template, {
     dir: installDir, user: userInfo().username, home: directory, node: executable

@@ -29,7 +29,9 @@ Stop any foreground Hub first. In the service user's shell:
 node scripts/render-unit.mjs --dir "$PWD" --user "$USER" --home "$HOME"
 ```
 
-The unit optionally reads `<installation>/deploy/zhiwei.env`; missing files do not block startup. If required, copy `zhiwei.env.example` to that path, fill in absolute `CODEX_CLI_PATH`, `CODEX_HOME` and a complete `PATH`, then set mode600. Use plain `KEY=value`, without `export`, `~`, `$HOME`, `$PATH` or command expansion. systemd does not load interactive shell startup files. `--env-file /absolute/path` selects a different file; rendering does not create or overwrite it and never copies authentication.
+The unit optionally reads `<installation>/deploy/zhiwei.env`; missing files do not block startup. If required, copy `zhiwei.env.example` to that path, fill in absolute `CODEX_CLI_PATH`, `CODEX_HOME` and a complete `PATH`, then set mode600. Use plain `KEY=value`, without `export`, `~`, `$HOME`, `$PATH` or command expansion. systemd does not load interactive shell startup files. `--service-env-file /absolute/path` selects a different file; rendering does not create or overwrite it and never copies authentication.
+
+The `--node` executable path must be a Linux absolute path without single quotes, double quotes, backslashes or ASCII control characters, and must not end with `/`; spaces, `%` and `$` are supported. This restriction applies to the executable path. Environment-file paths separately reject backslashes, glob characters (`*`, `?`, `[` and `]`) and trailing whitespace.
 
 In a separate administrator terminal, install the rendered unit (example user/path: `zhiwei`):
 
@@ -68,5 +70,6 @@ Back up before upgrading. Git-ignored runtime directories can live inside the ch
 - 已有 `data/local.json` 时安装包装脚本跳过初始化；直接调用setup则默认拒绝覆盖现存目标。
 - 单元以普通用户运行，`Restart=on-failure`，停机最多等 600 秒让写入完成。
 - 先确定服务用户，再以该用户登录Codex、初始化和渲染；管理员终端负责安装systemd单元，不复制其他用户的凭据。
-- 单元可选读取 `deploy/zhiwei.env`；可设置CLI绝对路径、CODEX_HOME和完整PATH，权限600，不能依赖shell变量展开。渲染参数 `--env-file` 可改路径，不会自动创建/覆盖该文件。
+- 单元可选读取 `deploy/zhiwei.env`；可设置CLI绝对路径、CODEX_HOME和完整PATH，权限600，不能依赖shell变量展开。渲染参数 `--service-env-file` 可改路径，不会自动创建/覆盖该文件。
+- `--node`须为Linux绝对路径，不能含单/双引号、反斜线或ASCII控制字符，也不能以 `/` 结尾；支持空格、`%`、`$`。环境文件路径另拒绝反斜线、通配字符（`*`、`?`、`[`、`]`）和末尾空白。
 - 升级前备份，保留 `data/`、`runtime/`、`tmp/`、远程工作区和环境文件；实际NapCat/CLI认证目录另行保全，见[运维](../docs/operate.md)。

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Render a Linux systemd unit without installing it or starting a service.
-// Optional: --env-file /absolute/path/to/zhiwei.env
+// Optional: --service-env-file /absolute/path/to/zhiwei.env
 import { readFile, writeFile } from 'node:fs/promises';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join, posix, resolve } from 'node:path';
@@ -36,6 +36,11 @@ export function renderUnit(template, { dir, user, home, node, envFile = posix.jo
   if (!/^[a-z_][a-z0-9_-]{0,31}$/i.test(user)) throw Error(`用户名称不合法：${user}`);
   validatePath(home, 'HOME');
   validatePath(node, 'node');
+  // systemd validates the decoded executable with string_is_safe(): quotes and
+  // backslashes are rejected even when correctly escaped in the unit text.
+  // https://github.com/systemd/systemd/blob/v255/src/basic/string-util.c
+  if (/["'\\]/.test(node)) throw Error('node 可执行路径不能包含单引号、双引号或反斜线（systemd 限制）');
+  if (node.endsWith('/')) throw Error('node 必须是可执行文件路径，不能以 / 结尾');
   const directory = rawPath(dir, '目录');
   const environmentFile = rawPath(envFile, '环境文件');
   // EnvironmentFile is also a glob expression. Reject ambiguous names rather
@@ -53,6 +58,7 @@ export function renderUnit(template, { dir, user, home, node, envFile = posix.jo
 }
 
 export async function main(argv = process.argv.slice(2)) {
+  if (argv.includes('--env-file')) throw Error('请改用 --service-env-file；--env-file 是 Node 自身的参数');
   const arg = (name, fallback) => {
     const index = argv.indexOf(`--${name}`);
     if (index < 0) return fallback;
@@ -65,7 +71,7 @@ export async function main(argv = process.argv.slice(2)) {
   const user = arg('user', process.env.SUDO_USER || currentUser);
   const home = arg('home', user === currentUser ? homedir() : `/home/${user}`);
   const node = resolve(arg('node', process.execPath));
-  const envFile = resolve(arg('env-file', join(dir, 'deploy', 'zhiwei.env')));
+  const envFile = resolve(arg('service-env-file', join(dir, 'deploy', 'zhiwei.env')));
   const out = resolve(arg('out', join(dir, 'deploy', 'zhiwei.service')));
   const template = await readFile(join(root, 'deploy', 'zhiwei.service.in'), 'utf8');
   const unit = renderUnit(template, { dir, user, home, node, envFile });

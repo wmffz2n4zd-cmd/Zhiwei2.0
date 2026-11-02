@@ -158,7 +158,7 @@ npm run doctor   # 连 QQ 桥接器、Codex CLI 一起看
 node scripts/render-unit.mjs --dir "$PWD" --user "$USER" --home "$HOME"
 ```
 
-systemd 不读取你的交互 shell 启动文件。需要自定义 CLI 路径、认证目录或 PATH 时，将 `deploy/zhiwei.env.example` 复制为 `deploy/zhiwei.env`，按真实环境填写绝对路径并设置 `chmod 600 deploy/zhiwei.env`。可用项为 `CODEX_CLI_PATH`、`CODEX_HOME`、`PATH`；不填的项目保持默认。环境文件使用 `KEY=value`，不写 `export`，不依赖 `$HOME` 或命令替换。默认单元会可选加载该文件；另选位置时渲染参数用 `--env-file /绝对路径/zhiwei.env`。该文件不会自动创建或覆盖，也不复制登录凭据。
+systemd 不读取你的交互 shell 启动文件。需要自定义 CLI 路径、认证目录或 PATH 时，将 `deploy/zhiwei.env.example` 复制为 `deploy/zhiwei.env`，按真实环境填写绝对路径并设置 `chmod 600 deploy/zhiwei.env`。可用项为 `CODEX_CLI_PATH`、`CODEX_HOME`、`PATH`；不填的项目保持默认。环境文件使用 `KEY=value`，不写 `export`，不依赖 `$HOME` 或命令替换。默认单元会可选加载该文件；另选位置时渲染参数用 `--service-env-file /绝对路径/zhiwei.env`。该文件不会自动创建或覆盖，也不复制登录凭据。
 
 回到有 sudo 权限的管理员终端安装服务（以下路径以专用用户 `zhiwei` 为例）：
 

@@ -41,6 +41,8 @@ jobs:
         run: |
           bash -n deploy/install.sh
           bash -n bin/zhiwei
+      - name: deployment regression
+        run: node --test tests/render-unit.test.mjs
       - name: unit and integration tests (serial)
         run: npm test
 

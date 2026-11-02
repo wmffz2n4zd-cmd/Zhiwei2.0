@@ -125,7 +125,7 @@ Note: **a file that is configured explicitly but cannot be read is a hard error*
 | `CODEX_REMOTE_CONTACT_ASSISTANT_PROFILE_PATH` | Overrides the persona file path. |
 | `TZ` | Service time zone, `Asia/Shanghai` recommended; the life timeline starts a new day on Beijing time. |
 
-systemd does not inherit an interactive shell's PATH. If customization is needed, copy `deploy/zhiwei.env.example` to `deploy/zhiwei.env` and set actual `CODEX_CLI_PATH`, `CODEX_HOME` and `PATH` values using absolute paths and mode600. The default unit optionally loads this file; `render-unit.mjs --env-file /absolute/path` selects another location. Log in to the CLI as the actual service user with the same HOME/CODEX_HOME. This file does not log in or copy credentials.
+systemd does not inherit an interactive shell's PATH. If customization is needed, copy `deploy/zhiwei.env.example` to `deploy/zhiwei.env` and set actual `CODEX_CLI_PATH`, `CODEX_HOME` and `PATH` values using absolute paths and mode600. The default unit optionally loads this file; `render-unit.mjs --service-env-file /absolute/path` selects another location. Log in to the CLI as the actual service user with the same HOME/CODEX_HOME. This file does not log in or copy credentials.
 
 ## 9. Common consequences of a broken configuration
 

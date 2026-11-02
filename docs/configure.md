@@ -125,7 +125,7 @@ export CODEX_REMOTE_CONTACT_ASSISTANT_PROFILE_PATH=/srv/my-persona.md
 | `CODEX_REMOTE_CONTACT_ASSISTANT_PROFILE_PATH` | 覆盖人格文件路径。 |
 | `TZ` | 服务时区，建议 `Asia/Shanghai`；生活时间线按北京时间切日。 |
 
-systemd 不继承交互 shell 的 PATH。需要自定义时，复制 `deploy/zhiwei.env.example` 为 `deploy/zhiwei.env` 并按实际环境填写 `CODEX_CLI_PATH`、`CODEX_HOME`、`PATH`（绝对路径，权限600）。默认单元可选加载此文件；`render-unit.mjs --env-file /绝对路径` 可改位置。CLI登录必须由实际服务用户完成，并使用相同的 HOME/CODEX_HOME；此文件不负责登录或复制凭据。
+systemd 不继承交互 shell 的 PATH。需要自定义时，复制 `deploy/zhiwei.env.example` 为 `deploy/zhiwei.env` 并按实际环境填写 `CODEX_CLI_PATH`、`CODEX_HOME`、`PATH`（绝对路径，权限600）。默认单元可选加载此文件；`render-unit.mjs --service-env-file /绝对路径` 可改位置。CLI登录必须由实际服务用户完成，并使用相同的 HOME/CODEX_HOME；此文件不负责登录或复制凭据。
 
 ## 9. 配置改坏的常见后果
 
