@@ -1,0 +1,22 @@
+# 运行数据、迁移副本与临时写入：仅放行说明文件
+data/*
+!data/README.md
+!data/qq-stickers/
+data/qq-stickers/*
+!data/qq-stickers/README.md
+
+runtime/
+tmp/
+napcat-data/
+workspaces/remote/
+deploy/zhiwei.service
+deploy/zhiwei.env
+.codex/
+.env
+.env.*
+!.env.example
+
+node_modules/
+*.log
+*.pid
+.DS_Store

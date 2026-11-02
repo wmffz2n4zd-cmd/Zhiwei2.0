@@ -1,0 +1,88 @@
+name: test
+
+# All runtime checks use a GitHub-hosted runner with synthetic credentials.
+# No production host, QQ account, or model login is used.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests on ubuntu 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: release integrity
+        run: sha256sum -c MANIFEST.sha256
+      - name: private files stay ignored
+        run: |
+          for path in data/local.json data/windows.local.json data/unified-memory.json.tmp tmp/qq-images/example.png deploy/zhiwei.env; do
+            git check-ignore -q "$path" || exit 1
+          done
+          for path in data/README.md data/qq-stickers/README.md deploy/zhiwei.env.example; do
+            if git check-ignore -q "$path"; then exit 1; fi
+          done
+      - run: npm ci
+      - name: syntax check
+        run: |
+          for f in $(git ls-files '*.js' '*.mjs'); do node --check "$f"; done
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
+      - name: shell syntax
+        run: |
+          bash -n deploy/install.sh
+          bash -n bin/zhiwei
+      - name: unit and integration tests (serial)
+        run: npm test
+
+  install:
+    name: install flow without credentials
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: initialize
+        run: |
+          node scripts/setup.mjs --owner 100001 --bot 100002 --napcat-dir /tmp/napcat
+          test -f data/local.json
+          test "$(stat -c %a data/local.json)" = "600"
+          test -f /tmp/napcat/onebot11_100002.json
+      - name: validate configuration
+        run: node scripts/check-config.mjs
+      - name: render systemd unit
+        run: |
+          node scripts/render-unit.mjs --dir "$PWD" --user runner --out /tmp/zhiwei.service
+          grep -q '^User=runner$' /tmp/zhiwei.service
+          grep -q 'src/server.js' /tmp/zhiwei.service
+          systemd-analyze verify /tmp/zhiwei.service
+      - name: cold start and health
+        run: |
+          printf 'process.exit(1);\n' > /tmp/no-model.mjs
+          export CODEX_CLI_PATH=/tmp/no-model.mjs
+          export CODEX_HOME=/tmp/zhiwei-no-credentials
+          node src/server.js > /tmp/hub.log 2>&1 &
+          HUB=$!
+          trap 'kill "$HUB" 2>/dev/null || true' EXIT
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3789/api/state > /tmp/state.json; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$HUB" 2>/dev/null || true
+          test "$ok" = "1"
+          grep -q '生活时间线' /tmp/hub.log
+          node -e "JSON.parse(require('fs').readFileSync('/tmp/state.json', 'utf8'))"

@@ -1,0 +1,20 @@
+# 统一用 LF 检出，避免在 Windows 上编辑后把 shell 脚本写成 CRLF
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.command text eol=lf
+*.mjs     text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.in      text eol=lf
+
+bin/*     text eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.tar.gz binary

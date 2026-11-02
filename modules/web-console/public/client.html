@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>知微 · 通讯中枢</title>
+    <link rel="stylesheet" href="client.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">知微 · 本机控制台</p>
+          <h1>通讯中枢</h1>
+        </div>
+        <div class="top-actions">
+          <span id="hubStatus" class="status-pill warn">连接中</span>
+          <button id="openHub" class="icon-button" title="打开 WebUI" aria-label="打开 WebUI">↗</button>
+          <button id="refresh" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        </div>
+      </section>
+
+      <section class="panel" id="platformPanel" hidden>
+        <div class="section-head compact"><div>
+          <h2>Windows 与 QQ 连接</h2>
+          <p id="platformSummary">正在检查本机接入状态…</p>
+        </div><a href="qq-setup.html">连接 QQ 与使用说明 →</a></div>
+        <p id="platformWorkspace"></p>
+        <p><a id="worldLink" href="/world" hidden>知微的阅读与留言板 →</a></p>
+        <p>管理员私聊：<code>/技能</code> 查看自定义 Skill；<code>/执行 任务描述</code> 提交任务，再发 <code>/确认</code>。</p>
+      </section>
+
+      <section class="switch-row">
+        <article class="switch-card">
+          <div>
+            <h2>iMessage</h2>
+            <p>可信联系人控制台，私聊可直接回应，远程执行模式从这里进入。</p>
+          </div>
+          <label class="switch">
+            <input id="imessageToggle" type="checkbox" />
+            <span></span>
+          </label>
+        </article>
+
+        <article class="switch-card">
+          <div>
+            <h2>QQ</h2>
+            <p id="qqScope">仅私聊；群消息与群邀请已停用。</p>
+          </div>
+          <label class="switch">
+            <input id="qqToggle" type="checkbox" />
+            <span></span>
+          </label>
+        </article>
+      </section>
+
+      <section class="maintenance">
+        <div class="section-head">
+          <div>
+            <h2>维护状态</h2>
+            <p id="lastUpdated">等待同步</p>
+          </div>
+          <button id="refreshMaintenance" class="button">立即检查</button>
+        </div>
+        <div id="healthGrid" class="health-grid"></div>
+      </section>
+
+      <section class="memory-panel panel">
+        <div class="section-head compact">
+          <div>
+            <h2>记忆管理</h2>
+            <p id="memoryDescription">查看统一记忆、iMessage 和远程执行模式记忆；QQ 对象记忆可在对应私聊使用 /记忆 查看。</p>
+          </div>
+          <button id="refreshMemory" class="button">刷新记忆</button>
+        </div>
+        <div class="memory-tabs" role="tablist" aria-label="记忆类型">
+          <button class="tab active" data-memory-tab="unified" type="button">统一记忆</button>
+          <button class="tab" data-memory-tab="imessage" type="button">iMessage</button>
+          <button class="tab" data-memory-tab="remoteExecution" type="button">远程执行模式</button>
+        </div>
+        <div id="memoryView" class="memory-view"></div>
+      </section>
+
+      <section class="split">
+        <article class="panel">
+          <div class="section-head compact">
+            <div>
+              <h2>iMessage 联系人</h2>
+              <p>只响应这些号码或邮箱。</p>
+            </div>
+            <strong id="handleCount">0</strong>
+          </div>
+          <div id="handleList" class="item-list"></div>
+          <form id="addHandleForm" class="inline-form">
+            <input id="handleInput" placeholder="手机号或邮箱" />
+            <button class="button primary" type="submit">添加</button>
+          </form>
+          <form id="replyHandleForm" class="inline-form reply-form">
+            <input id="replyHandleInput" placeholder="默认回复账号，可留空" />
+            <button class="button" type="submit">保存</button>
+          </form>
+        </article>
+      </section>
+
+      <section class="split">
+        <article class="panel">
+          <div class="section-head compact">
+            <div>
+              <h2>QQ 最近事件</h2>
+              <p>显示最近是否回复。</p>
+            </div>
+          </div>
+          <div id="qqEvents" class="events"></div>
+        </article>
+
+        <article class="panel">
+          <div class="section-head compact">
+            <div>
+              <h2>iMessage 最近事件</h2>
+              <p>命令、图片和私聊回应。</p>
+            </div>
+          </div>
+          <div id="imessageEvents" class="events"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="client.js"></script>
+  </body>
+</html>

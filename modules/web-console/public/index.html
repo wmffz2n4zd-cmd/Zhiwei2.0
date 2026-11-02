@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>知微 · Hub</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="status-band">
+        <div>
+          <p class="eyebrow">知微 · Hub</p>
+          <h1>通讯中枢</h1>
+          <p><a href="/life-observer.html">知微 · 生活观察（只读）</a></p>
+        </div>
+        <div id="overallStatus" class="status-pill">离线</div>
+      </section>
+
+      <section class="grid">
+        <article class="panel channel">
+          <div>
+            <h2>iMessage</h2>
+            <p>控制台、私聊和远程执行模式入口。</p>
+          </div>
+          <label class="switch">
+            <input id="imessageToggle" type="checkbox" />
+            <span></span>
+          </label>
+        </article>
+
+        <article class="panel channel">
+          <div>
+            <h2>QQ</h2>
+            <p>仅接收私聊，按对象保存对话记忆。</p>
+          </div>
+          <label class="switch">
+            <input id="qqToggle" type="checkbox" />
+            <span></span>
+          </label>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <h2>维护状态</h2>
+            <p>本机组件实时状态。</p>
+          </div>
+          <button id="refreshMaintenance" class="button small">刷新</button>
+        </div>
+        <div id="maintenanceGrid" class="health-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <h2>iMessage 控制台</h2>
+            <p>可信联系人与回复账号。</p>
+          </div>
+          <span id="imessageStatus" class="mode">未启动</span>
+        </div>
+        <div class="whitelist">
+          <div class="list-head">
+            <span>可信联系人</span>
+            <strong id="trustedHandleCount">0 个</strong>
+          </div>
+          <div id="trustedHandlesList" class="group-list"></div>
+        </div>
+        <div class="inline-form">
+          <label class="field compact">
+            <span>新增 iMessage 账号</span>
+            <input id="trustedHandleInput" placeholder="手机号或 Apple ID 邮箱" />
+          </label>
+          <button id="addTrustedHandle" class="button primary">添加</button>
+        </div>
+        <div class="inline-form">
+          <label class="field compact">
+            <span>默认回复账号</span>
+            <input id="replyHandleInput" placeholder="固定回复到这个手机号或邮箱" />
+          </label>
+          <button id="saveReplyHandle" class="button">保存</button>
+        </div>
+        <div class="memory-box">
+          <div class="list-head">
+            <span>最近命令</span>
+            <strong id="imessageError"></strong>
+          </div>
+          <div id="imessageEvents" class="events compact-events"></div>
+        </div>
+      </section>
+
+      <section class="panel tester">
+        <div class="section-head">
+          <div>
+            <h2>模拟 QQ 私聊</h2>
+            <p>仅预览回复，不发送 QQ 消息，也不写入正式对话记忆。</p>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="field">
+            <span>私聊对象 QQ 号</span>
+            <input id="senderId" placeholder="填写已允许私聊的 QQ 号" />
+          </label>
+          <label class="field">
+            <span>联系人昵称</span>
+            <input id="senderName" value="测试联系人" />
+          </label>
+        </div>
+        <label class="field">
+          <span>消息</span>
+          <textarea id="messageText">你好，今天怎么样？</textarea>
+        </label>
+        <div class="actions">
+          <button id="sendPrivate" class="button primary">预览私聊回复</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head">
+          <div>
+            <h2>事件记录</h2>
+            <p>最近 QQ 事件。</p>
+          </div>
+        </div>
+        <div id="events" class="events"></div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

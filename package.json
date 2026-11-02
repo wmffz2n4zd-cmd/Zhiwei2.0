@@ -1,0 +1,23 @@
+{
+  "name": "zhiwei",
+  "version": "2.0.0",
+  "private": true,
+  "description": "知微：一个只接受私聊的 QQ AI 伙伴，拥有持续向前的个人生活时间线、记忆与画像、持续情绪与长期兴趣。",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "setup": "node scripts/setup.mjs",
+    "check": "node scripts/check-config.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "world": "node scripts/world.mjs",
+    "test": "node --test --test-concurrency=1 tests/*.test.mjs",
+    "test:parallel": "node --test --test-concurrency=4 tests/*.test.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.64.1"
+  }
+}

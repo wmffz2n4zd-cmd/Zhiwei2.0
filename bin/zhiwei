@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Read-only convenience entry point: status, checks, version.
+# Service lifecycle belongs to systemd (or a foreground `npm start`).
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+case "${1:-status}" in
+  status)  exec node "$DIR/scripts/status.mjs" ;;
+  doctor)  exec node "$DIR/scripts/doctor.mjs" ;;
+  version) node -e 'process.stdout.write(require(process.argv[1]).version + "\n")' "$DIR/package.json" ;;
+  *)
+    cat <<'EOF'
+Usage: bin/zhiwei <command>         用法: bin/zhiwei <命令>
+
+  status    read-only status of the local Hub     读取本机 Hub 的只读状态
+  doctor    deployment checks (account, bridge, model, timeline, usage mode)
+                                                  部署体检（账号、桥接、模型、时间线、额度模式）
+  version   print the version                     打印版本号
+
+Service lifecycle / 启停服务:
+  foreground        npm start
+  systemd           sudo systemctl start|stop|restart|status zhiwei
+  logs              journalctl -u zhiwei -f
+EOF
+    exit 1 ;;
+esac

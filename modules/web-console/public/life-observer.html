@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>知微 · 生活观察</title>
+  <link rel="stylesheet" href="/life-observer.css">
+  <script src="/life-observer.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="page-head">
+      <div><p class="eyebrow">ZHIWEI / OBSERVER</p><h1>生活观察</h1><p class="subhead">看看念头、兴趣和经历，如何随时间留下痕迹。</p></div>
+      <div class="head-links"><span class="badge">只读 · 公共生活</span><a href="/index.html">返回中枢 ↗</a></div>
+    </header>
+    <section class="toolbar" aria-label="报告范围">
+      <label>查看范围<select id="range"><option value="7">最近 7 天</option><option value="1">指定一天</option></select></label>
+      <label>北京时间日期<input id="date" type="date" disabled></label>
+      <button id="refresh" type="button" class="primary">刷新</button>
+      <button id="download" type="button" disabled>导出当日 JSON</button>
+      <span id="exportHint" class="hint">选择一天后，可导出当前报告。</span>
+    </section>
+    <p id="message" class="message" role="status" aria-live="polite">正在读取生活记录…</p>
+    <section class="overview" aria-label="生活统计">
+      <article class="stat"><span>新念头</span><strong id="thoughtCount">—</strong><p>在所选范围内留下的新念头</p></article>
+      <article class="stat"><span>已完成活动</span><strong id="activityCount">—</strong><p>只计算完成，计划和中断不计入</p></article>
+      <article class="snapshot"><span id="completeness" class="badge neutral">正在读取</span><p id="window">—</p><p id="cutoff" class="hint">—</p><p id="snapshot" class="hint"></p></article>
+    </section>
+    <section class="panel" aria-labelledby="interestHeading">
+      <div class="section-head"><div><p class="eyebrow">INTERESTS</p><h2 id="interestHeading">兴趣的变化</h2></div><span class="unit">内部强度 0—1</span></div>
+      <p class="section-note">净变化包含经历影响与自然衰减。展开条目可查看已发生的依据和后续引用。</p>
+      <div id="interests"><p class="empty">正在读取…</p></div>
+    </section>
+    <section class="panel" aria-labelledby="eventsHeading">
+      <div class="section-head"><div><p class="eyebrow">TIMELINE</p><h2 id="eventsHeading">最近事件</h2></div><span id="eventCount" class="unit"></span></div>
+      <p class="section-note">角色生活与真实外部经历分开展示。引用说明关联，不证明某个兴趣单独导致了行为。</p>
+      <div id="events"><p class="empty">正在读取…</p></div>
+    </section>
+    <footer><p id="notes"></p><p>查看、刷新和导出只读取已有记录，不生成念头，也不推进活动。</p></footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>连接 QQ · 知微</title>
+<link rel="stylesheet" href="client.css">
+<style>main{max-width:900px;margin:40px auto;padding:24px}section{margin:20px 0;padding:24px}p,li{line-height:1.8}code{background:#eef0f4;padding:3px 6px;border-radius:4px;color:#273650}pre{white-space:pre-wrap;line-height:1.8}a{color:#267b73}h2{margin-bottom:12px}</style>
+<main><a href="/">← 返回通讯中枢</a><h1>把 QQ 接到这台 Linux 服务器</h1>
+<p>服务器上同时运行 Hub 与 NapCat，你在手机上的 QQ 给机器人账号发私聊。知微使用 <code>config/zhiwei-profile.md</code> 里的人格，Codex CLI 负责生成回复或执行任务。</p>
+<section class="panel"><h2>1. 登录机器人 QQ</h2>
+<p>准备一个独立的 QQ 账号作为机器人，与你的管理员账号互加好友。按 <a href="https://napneko.github.io/guide/boot/Shell" target="_blank" rel="noreferrer">NapCat 官方文档</a>在这台机器上安装 NapCat（Linux 无桌面环境时需要 <code>xvfb-run</code>）。</p>
+<p>管理员账号与机器人账号必须不同；管理员继续在手机上正常使用。</p></section>
+<section class="panel"><h2>2. 写入两个 HTTP 连接</h2>
+<p>初始化时如果给了 <code>--napcat-dir</code>，项目已经生成 <code>onebot11_&lt;机器人QQ&gt;.json</code>，直接放进 NapCat 的配置目录即可。也可以在 NapCat「网络配置」里手工填写：</p>
+<ul><li><b>HTTP 服务端</b>：启用，Host <code>127.0.0.1</code>，端口 <code>3000</code>，Token = <code>data/local.json</code> 里的 <code>oneBotAccessToken</code>。</li>
+<li><b>HTTP 客户端</b>：启用，URL <code>http://127.0.0.1:3789/api/onebot/event</code>，Token = <code>data/local.json</code> 里的 <code>oneBotSecret</code>。</li>
+<li>消息格式选 <code>array</code>，关闭「上报自身消息」。保存后让连接生效。</li></ul>
+<p>两个 Token 用途不同，分别复制。不要把它们发到任何群或仓库。</p>
+<p>回到首页刷新，或在项目目录运行 <code>npm run doctor</code>，应看到 QQ 桥接器在线。</p></section>
+<section class="panel"><h2>3. 在手机上试用</h2>
+<pre>/帮助
+/状态
+用生活中的例子解释惯性
+
+/执行 在工作目录创建一个 hello.txt，内容为你好
+/确认</pre>
+<p>普通聊天不会进入写文件模式。每个 <code>/执行</code> 任务需要在 3 分钟内确认；<code>/取消</code> 只取消待确认任务。执行结果回到管理员私聊。</p></section>
+<section class="panel"><h2>4. 自定义 Skill 与任务</h2>
+<p>普通聊天默认使用知微人格。需要自定义 Skill 时，在 <code>data/local.json</code> 的 <code>skills</code> 里添加路径，重启后用 <code>/技能</code> 查看并选择；<code>/技能 none</code> 恢复默认。</p>
+<p>继续任务时，发送 <code>/执行 你的补充或下一步</code> 并确认。较长任务请拆成多次；单次超时为 10 分钟。</p>
+<p>任务默认只能写入 <code>workspace</code> 指定的目录。<code>/执行完全访问</code> 需要显式打开 <code>allowFullAccessTasks</code>，请先阅读 <code>docs/security.md</code>。</p></section>
+</main></html>

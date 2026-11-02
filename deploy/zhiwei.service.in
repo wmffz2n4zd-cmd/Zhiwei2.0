@@ -1,0 +1,28 @@
+[Unit]
+Description=Zhiwei private-chat hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@DIR@
+Environment=@HOME_ENV@
+Environment=TZ=Asia/Shanghai
+Environment=NODE_ENV=production
+# Optional persistent CLI location, login directory and PATH; see zhiwei.env.example.
+EnvironmentFile=-@ENV_FILE@
+# ':' disables environment expansion in this literal command path.
+ExecStart=:@NODE@ src/server.js
+Restart=on-failure
+RestartSec=5
+# 让已接收的消息、记忆与生活状态有机会写完再退出。
+TimeoutStopSec=600
+KillMode=mixed
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
