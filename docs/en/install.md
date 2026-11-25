@@ -1,4 +1,4 @@
-# Install Zhiwei v2.03
+# Install Zhiwei v2.03-r1
 
 [中文](../install.md) · [Back to Zhiwei](../../README.md)
 
@@ -11,7 +11,7 @@ Choose a public hostname you control, point its DNS at this server, and allow in
 In a fresh Bash session, download the tagged release and its locked Node dependencies as your normal user.
 
 ```bash
-git clone --branch v2.03 --depth 1 https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git zhiwei-v203
+git clone --branch v2.03-r1 --depth 1 https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git zhiwei-v203
 cd zhiwei-v203
 sha256sum --quiet -c MANIFEST.sha256
 npm ci

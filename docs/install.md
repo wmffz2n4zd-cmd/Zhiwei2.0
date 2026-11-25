@@ -1,4 +1,4 @@
-# 安装知微 v2.03
+# 安装知微 v2.03-r1
 
 [English](en/install.md) · [返回项目首页](../README.zh-CN.md)
 
@@ -11,7 +11,7 @@
 打开新的 Bash 会话，用普通用户下载带标签的发行版，核对清单并安装锁文件指定的依赖。
 
 ```bash
-git clone --branch v2.03 --depth 1 https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git zhiwei-v203
+git clone --branch v2.03-r1 --depth 1 https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git zhiwei-v203
 cd zhiwei-v203
 sha256sum --quiet -c MANIFEST.sha256
 npm ci

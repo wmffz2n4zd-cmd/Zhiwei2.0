@@ -64,26 +64,44 @@ jobs:
           test "$status" = "401"
           npm run --silent invite -- --database data/pwa/pwa.sqlite --origin https://pwa.test > "$RUNNER_TEMP/invite.json"
           node -e "const a=require(process.argv[1]); if(!a.secret || !a.link.startsWith('https://pwa.test/#invite='))process.exit(1)" "$RUNNER_TEMP/invite.json"
+      - name: Install the browser specified by the locked Playwright package
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /var/cache/zhiwei-browsers
+        run: |
+          sudo env PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" "$(command -v node)" \
+            node_modules/playwright-core/cli.js install --with-deps chromium
+          browser=$(node -p "require('playwright-core').chromium.executablePath()")
+          test -x "$browser"
+          node -p "'playwright-core ' + require('playwright-core/package.json').version"
+          "$browser" --version
+          echo "ZHIWEI_TEST_BROWSER=$browser" >> "$GITHUB_ENV"
       - name: Exercise a program in the isolated systemd worker
         run: |
-          # Hosted Ubuntu provides the full Chrome installation at this path.
-          browser=/opt/google/chrome/chrome
-          test -x "$browser"
           python=/usr/bin/python3
           installer=scripts/ecs/creative-program-service.py
+          # Only this synthetic CI worker records the browser startup trace.
+          dropin=/run/systemd/system/zhiwei-creative@.service.d
+          sudo install -d "$dropin"
+          printf '[Service]\nEnvironment=DEBUG=pw:browser\n' | sudo tee "$dropin/diagnostics.conf" >/dev/null
           sudo "$python" "$installer" start --source "$PWD" --node "$(command -v node)" \
-            --dependencies "$PWD/node_modules" --browser "$browser" --client-group "$(id -gn)"
+            --dependencies "$PWD/node_modules" --browser "$ZHIWEI_TEST_BROWSER" --client-group "$(id -gn)"
           trap 'sudo "$python" "$installer" stop' EXIT
-          npm run check:runner
+          for trial in 1 2; do
+            echo "Independent browser start $trial"
+            if ! npm run check:runner; then
+              sudo journalctl -b -u 'zhiwei-creative@*.service' --no-pager -n 100
+              exit 1
+            fi
+          done
 
   release:
-    name: Publish v2.03
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release v2.03]')
+    name: Publish v2.03-r1
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release v2.03-r1]')
     needs: [test, install]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-    concurrency: publish-zhiwei-v2-03
+    concurrency: publish-zhiwei-v2-03-r1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,11 +110,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tagged=$(git ls-remote --tags origin refs/tags/v2.03)
+          tag=v2.03-r1
+          test "$(cat VERSION)" = "$tag"
+          tagged=$(git ls-remote --tags origin "refs/tags/$tag")
           if [ -n "$tagged" ]; then
-            resolved=$(gh api "repos/$GITHUB_REPOSITORY/commits/v2.03" --jq .sha)
+            resolved=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)
             test "$resolved" = "$GITHUB_SHA"
-            gh release view v2.03 --json url --jq .url
-            exit 0
           fi
-          gh release create v2.03 --target "$GITHUB_SHA" --title '知微 v2.03' --notes-file docs/release-v2.03.md
+          if gh release view "$tag" --json url --jq .url; then
+            test -n "$tagged"
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --latest --title "知微 $tag" --notes-file "docs/release-$tag.md"
+          fi

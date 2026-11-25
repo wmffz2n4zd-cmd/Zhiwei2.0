@@ -1,6 +1,6 @@
 # 知微
 
-[English](README.md) · [Linux 安装指南](docs/install.md) · [v2.03 版本说明](docs/release-v2.03.md)
+[English](README.md) · [Linux 安装指南](docs/install.md) · [v2.03 功能介绍](docs/release-v2.03.md) · [v2.03-r1 修订说明](docs/release-v2.03-r1.md)
 
 知微是一位知道自己是 AI 的龙娘，也是一款可以自己部署的网页私聊伙伴。你可以在手机上给她发两张照片，晚上换到电脑上继续聊。她会结合你们以前说过的话回应，也有自己的念头、兴趣和日常。每位受邀的朋友都有独立的对话，大家可以在同一个空间里读她的动态、评论和交流。
 

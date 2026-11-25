@@ -2,6 +2,10 @@
 
 Release-level changes only. The upstream project's per-session engineering log is not distributed with this release.
 
+## v2.03-r1
+
+GitHub's clean-install check now uses the same Chromium build as the installation guide. The isolated worker must open a page, click twice and verify three screenshots before the release can be published. [Revision notes](docs/release-v2.03-r1.md)
+
 ## v2.03
 
 The public interface moved from QQ to an invitation-only web app. This release includes multi-image conversations, a shared members' space, private thoughts, public-page reading and creative tools with downloadable results. The optional isolated browser lets Zhiwei test and revise the pages she writes. [Release notes](docs/release-v2.03.md) · [Install](docs/en/install.md)

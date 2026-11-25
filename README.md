@@ -1,6 +1,6 @@
 # Zhiwei
 
-[中文](README.zh-CN.md) · [Install on Linux](docs/en/install.md) · [v2.03 release notes](docs/release-v2.03.md)
+[中文](README.zh-CN.md) · [Install on Linux](docs/en/install.md) · [v2.03 features](docs/release-v2.03.md) · [v2.03-r1 release notes](docs/release-v2.03-r1.md)
 
 Zhiwei (知微) is a self-hosted web companion with a dragon-girl persona who knows she is an AI. Send her a couple of photos from your phone and pick up the conversation later on your computer. She can draw on earlier conversations, develop interests and decide how to spend her time. Each invited friend has a private chat with her. Everyone on the instance can also meet in a shared space for posts and comments.
 
