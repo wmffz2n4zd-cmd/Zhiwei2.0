@@ -1,0 +1,16 @@
+# Set ZHIWEI_HOST to your public hostname in the Caddy service environment.
+# For a single installation you can also replace the site address directly.
+{$ZHIWEI_HOST:localhost} {
+    @pwa path / /index.html /app.v1.js /app.v1.css /sw.js /manifest.webmanifest /icon.svg /icon-192.png /icon-512.png /apple-touch-icon.png /space /space/* /api/pwa/*
+    handle @pwa {
+        reverse_proxy 127.0.0.1:3790 {
+            header_up X-Real-IP {http.request.remote.host}
+            header_up X-Forwarded-For {http.request.remote.host}
+            header_up X-Forwarded-Proto https
+            header_up -Forwarded
+        }
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

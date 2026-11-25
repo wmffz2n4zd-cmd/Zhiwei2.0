@@ -1,199 +1,112 @@
-# 安装（Ubuntu 24.04 x86_64）
+# 安装知微 v2.03
 
-> English: [docs/en/install.md](en/install.md)
+[English](en/install.md) · [返回项目首页](../README.zh-CN.md)
 
-这版只支持 Ubuntu 24.04 / x86_64。本地电脑、虚拟机、云服务器都可以，最低建议 2 vCPU / 4 GiB 内存 / 20 GiB 磁盘。
+## 准备独立的 Linux 主机
 
-安装完成后，这台机器上会有三个进程：
+下列命令以 Ubuntu 24.04 x86-64 和 systemd 为例。先安装 Git、curl、Python 3、util-linux（提供 `flock`）、Caddy、Node.js 24 和 npm。Codex CLI 需要让系统服务也能找到，例如执行 `sudo npm install -g @openai/codex`。服务在 `/usr/local/bin:/usr/bin:/bin` 查找 Node 和 Codex。如果安装位置不同，在 `/etc/zhiwei.env` 设置完整 `PATH`，需要时另设 `CODEX_CLI_PATH`。
 
-| 进程 | 作用 | 端口 |
-| --- | --- | --- |
-| 知微 Hub（本项目） | 收消息、管记忆、调模型、排生活 | `127.0.0.1:3789` |
-| NapCat | 登录机器人 QQ，转成 OneBot 协议 | `127.0.0.1:3000`（API）、`127.0.0.1:6099`（WebUI） |
-| Codex CLI | 真正生成回复和执行任务的模型客户端 | 无（子进程） |
+选择自己控制的域名，将 DNS 指向这台服务器，并在防火墙和云安全组开放 TCP 80、443。示例使用系统账号 `zhiwei`、目录 `/srv/zhiwei` 和服务名 `zhiwei.service`。机器上若已运行旧实例，先看[已有实例](#已有实例)。
 
----
-
-## 0. 你需要先准备
-
-1. **一个独立的机器人 QQ 号**，与你的管理员 QQ 互加好友。机器人号不能和你自己的号相同，也不能同时在手机桌面版登录。
-2. **Codex CLI 可用的账号**。模型调用由 CLI 发起，费用和额度遵循所配置的账号与登录方式。
-3. 服务器能访问 QQ 与模型服务所需的网络。国内网络访问模型通常需要代理，见 `docs/configure.md` 的 `codexProxy`。
-
----
-
-## 1. 系统依赖
+打开新的 Bash 会话，用普通用户下载带标签的发行版，核对清单并安装锁文件指定的依赖。
 
 ```bash
-sudo apt update
-sudo apt install -y curl git unzip xvfb fonts-noto-cjk
-```
-
-`xvfb` 只在服务器没有图形界面、又需要跑 NapCat / Chromium 时才必需。`fonts-noto-cjk` 用于截图里的中文。
-
-## 2. Node.js 20 以上
-
-已验证版本：**Node v24.22.0**；最低 **20.10**（`npm test` 使用 `--test-concurrency`）。推荐用 NodeSource：
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-sudo apt install -y nodejs
-node -v   # 应 >= 20
-```
-
-> 不要用 Ubuntu 自带的 Node 18：本项目要求 `>=20`，低于该版本启动会直接失败。
-
-## 3. 先选定服务用户，再登录 Codex CLI
-
-在管理员终端创建普通服务用户，然后切换过去。后续克隆、初始化、CLI 登录和前台检查都以这个用户执行；已有专用用户时跳过创建：
-
-```bash
-sudo useradd -m -s /bin/bash zhiwei
-sudo -iu zhiwei
-```
-
-在该用户下安装官方 Codex CLI 并登录：
-
-```bash
-codex --version
-codex login          # 按 CLI 提示完成认证
-codex login status   # 显示已登录即可
-```
-
-如果 `codex` 不在 PATH 中，设置 `CODEX_CLI_PATH` 指向可执行文件（或 npm 包里的 `bin/codex.js`）。登录归属于当前用户的 Codex 配置目录；不要先用 root 登录再改用 `zhiwei` 运行。自定义 `CODEX_HOME` 时，登录与 systemd 必须使用同一个绝对路径。认证由 CLI 管理，不复制其他用户的登录文件。
-
-## 4. 获取代码并安装依赖
-
-```bash
-git clone https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git ~/zhiwei
-cd ~/zhiwei
+git clone --branch v2.03 --depth 1 https://github.com/wmffz2n4zd-cmd/Zhiwei2.0.git zhiwei-v203
+cd zhiwei-v203
+sha256sum --quiet -c MANIFEST.sha256
 npm ci
+node -v
+flock --version
 ```
 
-如果你拿到的是压缩包：
+将刚核验的代码和依赖复制到服务目录。代码归 root，服务账号可以写自己的主目录和四个实例数据目录。用承担模型调用额度的账号完成 Codex 设备登录。
 
 ```bash
-tar -xzf zhiwei-2.0.0.tar.gz
-cd zhiwei-2.0.0
-npm ci
+set -e
+sudo useradd --system --user-group --create-home --home-dir /home/zhiwei --shell /usr/sbin/nologin zhiwei
+sudo mkdir /srv/zhiwei
+sudo cp -a . /srv/zhiwei/
+cd /srv/zhiwei
+sudo chown -R root:root /srv/zhiwei
+sudo install -d -m 700 -o zhiwei -g zhiwei data runtime tmp workspaces
+sudo -H -u zhiwei codex login --device-auth
+sudo -H -u zhiwei codex login status
 ```
 
-依赖只有 `playwright-core` 一个，用于网页浏览；不装浏览器也能启动，只是阅读能力不可用。
+## 启动私聊
 
-## 5. 初始化配置
+将下一段中的 `chat.example.org` 换成实际域名。初始化会创建仅服务账号可读写的 `data/windows.local.json`，Linux 也沿用这个配置文件名。模板选用 `gpt-6.1-terra` 和 medium 推理强度。如果你的 CLI 账号使用其他可读图模型，可在启动前修改 `chatModel`。
 
 ```bash
-npm run setup -- --owner 你的QQ号 --bot 机器人QQ号
-```
-
-它会：
-
-- 生成 `data/local.json`（权限 600），内含**本实例独有**的 OneBot 密钥对；
-- 生成 NapCat 的 `onebot11_<机器人QQ>.json`（如果给了 `--napcat-dir`）；
-- 创建 `runtime/`、`workspaces/remote/` 等目录。
-
-`--napcat-dir /实际NapCat配置目录` 是可选的输出路径，必须由你按实际安装位置填写；脚本不会发现 NapCat，也不会自动加载任意目录里的配置。如果先输出到临时目录，需自行将生成的 `onebot11_<机器人QQ>.json` 放入该 NapCat 实例实际使用的配置目录，再按 NapCat 的方式重新加载；也可在 WebUI 手动配置下节的两条连接。保留现有连接配置，确认替换范围后再覆盖。
-
-其它可用参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `--chromium /usr/bin/chromium` | 指定浏览器；不填则网页阅读不可用（生活规划不受影响） |
-| `--qq-image-cache-root /实际缓存目录` | QQ 图片目录白名单，可重复传入多个目录；不能使用文件系统根目录。未配置时图片/静态表情视觉不可用，文字仍可用 |
-| `--napcat-dir /实际配置目录` | 在此目录生成 OneBot 配置；不安装或自动发现 NapCat |
-| `--no-life` | 关闭生活时间线（不推荐，等于只有一个聊天机器人） |
-| `--force` | 覆盖前分别备份已有主配置和所选 NapCat 配置；默认拒绝覆盖任一现存目标。备份与新文件权限为600 |
-
-图片缓存目录应是当前 NapCat 实际落盘的目录，且服务用户有读取权限。例如需要两个目录时，追加 `--qq-image-cache-root /实际缓存A --qq-image-cache-root /实际缓存B`；不要为省事放行整个家目录或磁盘。
-
-## 6. 安装并登录 NapCat
-
-按 [NapCat 官方文档](https://napneko.github.io/guide/boot/Shell) 安装 Linux 版。历史上游部署记录使用过 NapCat `v4.18.41` + QQ NT `3.2.34`，不代表本发行包已完成真实 QQ 验收。无桌面环境时可用 `xvfb-run`，下面可执行路径必须替换为实际安装位置：
-
-```bash
-xvfb-run -a ~/Napcat/opt/QQ/qq --no-sandbox
-```
-
-首次启动打开 NapCat WebUI（默认 `http://127.0.0.1:6099`），扫码登录**机器人** QQ。
-
-登录后确认「网络配置」里有两条连接。只有配置文件放在实际加载目录并被 NapCat 读取后，生成的配置才生效：
-
-- HTTP 服务端 `127.0.0.1:3000`，Token = `data/local.json` 的 `oneBotAccessToken`；
-- HTTP 客户端 `http://127.0.0.1:3789/api/onebot/event`，Token = `data/local.json` 的 `oneBotSecret`。
-
-> 服务器没有浏览器可打开 WebUI 时，用 SSH 端口转发：`ssh -L 6099:127.0.0.1:6099 用户@服务器`。
-
-## 7. 启动
-
-前台试跑：
-
-```bash
-npm start
-```
-
-应看到启动自检，例如：
-
-```
-知微 chat hub: http://127.0.0.1:3789
-知微配置：.../data/local.json（全部就绪）
-  OK   管理员 QQ：...
-  OK   OneBot 回调密钥：已配置
-  ...
-```
-
-任何一项 `TODO` 都说明对应能力不可用，按提示补齐即可；服务本身仍会启动。
-
-另开一个终端做体检：
-
-```bash
-npm run check    # 只看配置是否自洽，不启动服务
-npm run doctor   # 连 QQ 桥接器、Codex CLI 一起看
-```
-
-## 8. 常驻运行（systemd）
-
-先用 `Ctrl+C` 正常结束前台 Hub，避免两实例并发写数据。仍在服务用户终端渲染单元；确认 `$USER`、`$HOME` 就是前面完成 CLI 登录的用户：
-
-```bash
-node scripts/render-unit.mjs --dir "$PWD" --user "$USER" --home "$HOME"
-```
-
-systemd 不读取你的交互 shell 启动文件。需要自定义 CLI 路径、认证目录或 PATH 时，将 `deploy/zhiwei.env.example` 复制为 `deploy/zhiwei.env`，按真实环境填写绝对路径并设置 `chmod 600 deploy/zhiwei.env`。可用项为 `CODEX_CLI_PATH`、`CODEX_HOME`、`PATH`；不填的项目保持默认。环境文件使用 `KEY=value`，不写 `export`，不依赖 `$HOME` 或命令替换。默认单元会可选加载该文件；另选位置时渲染参数用 `--service-env-file /绝对路径/zhiwei.env`。该文件不会自动创建或覆盖，也不复制登录凭据。
-
-回到有 sudo 权限的管理员终端安装服务（以下路径以专用用户 `zhiwei` 为例）：
-
-```bash
-sudo cp /home/zhiwei/zhiwei/deploy/zhiwei.service /etc/systemd/system/zhiwei.service
+ZHIWEI_DOMAIN=chat.example.org
+sudo -H -u zhiwei npm run setup -- "https://$ZHIWEI_DOMAIN"
+sudo install -m 0644 scripts/ecs/zhiwei.service /etc/systemd/system/zhiwei.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now zhiwei
-sudo systemctl status zhiwei
-journalctl -u zhiwei -f
+sudo systemctl enable --now zhiwei.service
+sudo systemctl is-active zhiwei.service
+curl -fsS -H "Host: $ZHIWEI_DOMAIN" http://127.0.0.1:3790/ > /dev/null
+curl -sS -o /dev/null -w '%{http_code}\n' -H "Host: $ZHIWEI_DOMAIN" http://127.0.0.1:3790/api/pwa/me
 ```
 
-服务以普通用户运行，只监听 `127.0.0.1`。**不要把 3789 端口直接暴露到公网。**
+首页应能取到，最后一条命令应返回 **401**，表示访客需要登录。服务启动失败时，查看 `sudo journalctl -u zhiwei -n 60`。检查模型登录时也应使用服务账号。
 
-## 9. 第一次对话
+## 启用 HTTPS，签发第一份邀请
 
-用你的管理员 QQ 私聊机器人：
+将附带的 Caddy 配置作为独立站点导入。在第一个编辑器中，把整个 `{$ZHIWEI_HOST:localhost}` 替换为实际域名。在第二个编辑器中，与已有站点并列增加一行 `import /etc/caddy/zhiwei.caddy`。配置把网页路由转发至本机 3790 端口。开发者管理界面使用本机 3789 端口，保持仅回环可达。
 
-```text
-/帮助
-/状态
+```bash
+sudo install -m 0644 deploy/Caddyfile /etc/caddy/zhiwei.caddy
+sudoedit /etc/caddy/zhiwei.caddy
+sudoedit /etc/caddy/Caddyfile
 ```
 
-能收到回复就说明链路通了。之后可以正常聊天，`/` 开头的才是指令。
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl enable --now caddy
+sudo systemctl reload caddy
+curl -fsS "https://$ZHIWEI_DOMAIN/" > /dev/null
+curl -sS -o /dev/null -w '%{http_code}\n' "https://$ZHIWEI_DOMAIN/api/pwa/me"
+```
 
----
+公网首页应能取到，访客接口再次返回 **401**。在仓库目录执行以下命令，可签发一份 24 小时内有效的一次性邀请。
 
-## 常见安装失败
+```bash
+sudo -H -u zhiwei npm run --silent invite -- \
+  --database data/pwa/pwa.sqlite --origin "https://$ZHIWEI_DOMAIN" --role friend --hours 24
+```
 
-| 现象 | 原因与处理 |
-| --- | --- |
-| 启动报 `生活规划需要启用world...` | `life.planning.enabled=true` 时 `world.enabled` 必须为 `true`。在现有配置中修正这两个开关的组合，再运行 `npm run check`；不要为修一个开关重建全部配置和密钥 |
-| 回调 401 | 两个 Token 用反了。服务端 Token 给 NapCat 的 HTTP 服务端，回调 Token 给 HTTP 客户端。 |
-| `npm run doctor` 显示 Codex CLI 待处理 | 核对实际服务用户、HOME/CODEX_HOME、CLI路径和登录状态；交互终端可用不等于systemd环境相同。需要时填写 `deploy/zhiwei.env` 后重启 |
-| QQ 没有回复 | 先看 `npm run doctor` 的桥接器一项，再看日志里是否有模型超时。 |
-| 端口被占用 `EADDRINUSE` | 已经有一个 Hub 在跑；先正常停止既有实例。不要仅换端口启动另一个共享同一数据目录的实例 |
-| 服务器休眠/卡顿后生活记录出现“中断” | 观测空档超过 2 分钟会被判定为中断，这是设计行为，不是崩溃。 |
+将输出里的完整邀请链接私下交给对应朋友。对方打开 HTTPS 链接，设置自己的账号和密码，即可开始聊天。每份新邀请都会建立一个新身份。同一实例的已登录成员可以共读空间动态和评论，私聊作品按接收账号取用。iPhone 用户可先将网页添加到主屏幕，再在知微内开启通知并授予系统权限。
 
-下一步：`docs/configure.md` 调配置，`docs/operate.md` 学日常运维。
+## 安装浏览器并实测交互网页
+
+用发行版的 Playwright 依赖下载匹配的 Chromium。以下命令把浏览器装在固定目录，供网页服务和独立运行器使用。在 Hub 已正常启动、邀请朋友测试自写网页前执行。
+
+```bash
+cd /srv/zhiwei
+BROWSER_CACHE=/var/cache/zhiwei-browsers
+sudo env PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" node node_modules/playwright-core/cli.js install --with-deps chromium
+BROWSER=$(PLAYWRIGHT_BROWSERS_PATH="$BROWSER_CACHE" node -p "require('playwright-core').chromium.executablePath()")
+test -x "$BROWSER"
+sudo install -d -m 0755 /etc/systemd/system/zhiwei.service.d
+printf '[Service]\nEnvironment=PLAYWRIGHT_BROWSERS_PATH=%s\n' "$BROWSER_CACHE" | sudo tee /etc/systemd/system/zhiwei.service.d/browser.conf > /dev/null
+sudo python3 scripts/ecs/creative-program-service.py start --persistent \
+  --source "$PWD" --node "$(command -v node)" --dependencies "$PWD/node_modules" \
+  --browser "$BROWSER" --client-group zhiwei
+sudo systemctl daemon-reload
+sudo systemctl restart zhiwei.service
+sudo -H -u zhiwei npm run check:runner
+```
+
+最后的检查以 Hub 服务账号实际打开网页、点击两次并验证三张截图。进入私聊，请知微做一个带日夜切换按钮的小网页，下载 HTML 后可断网打开复测。systemd 为每个任务提供独立身份、文件系统和隔离网络，Hub 通过 Unix socket 发现运行器。未安装该运行器时，网站工具仍可按规格生成单页。
+
+## 按需开启的能力
+
+- **网页阅读。** 安装的 Chromium 支持只读浏览。公开主题关键词使用小红书检索，知微也能沿公开文章实际给出的链接续读。站点要求登录时，通过已认证的 SSH 隧道访问本机 3789 端口的 `/world`，并准备服务账号可用的图形会话，在站点自己的窗口完成登录。读取已知 X 原帖可单独配置 `world.xBrowser`，为它指定独立的绝对路径，与默认站点的浏览器资料和截图分开。
+- **自主活动与用量。** 模板启用学习、私聊念头和共享空间。后台生活规划与自主浏览初始关闭。需要主动规划时，在 `data/windows.local.json` 开启 `life.planning.enabled` 并重启服务。自主浏览可在本机 `/world` 页面开启。`runtimeBudget.mode: "observe"` 表示记录用量，额度来自部署者自己的账号。绘图还需要 CLI 账号及模型支持图片生成工具。
+- **B 站视频。** 视频取材按需开启。浏览器会话方式需要 Linux、可运行沙箱的 Chromium，以及服务账号自己拥有的 `~/.local/share/zhiwei-video-sessions/bilibili`。该目录与上一级目录权限均为 0700。将 `video.enabled` 设为 true，`video.platforms` 和 `video.sessionBrowser.platforms` 设为 `["bilibili"]`，`video.sessionBrowser.executablePath` 填入 `printf '%s\n' "$BROWSER"` 打印的完整路径。改完配置重启，服务会先探测依赖。站点限制访问或取材不足时，以实际返回的结果为准。
+
+## 已有实例
+
+若你使用早期 QQ v2.0，操作前先取得包含程序、私有配置、完整数据、媒体和账号状态的一致备份。保留可继续使用的旧版，首次试用可在独立主机或虚拟机安装 v2.03。同机并行需要单独的服务账号、主目录、代码和可写数据目录、systemd 服务名、域名及可用端口。管理端口通过 `PORT` 配置，网页端口通过 `pwa.port` 配置，反代要指到新端口。两套独立网页运行器并存时，还需区分服务单元名和 `ZHIWEI_CREATIVE_RUNNER_SOCKET`。
+
+用新邀请验注册、普通回复、发图和作品下载，再决定如何切换。初始化会保留已有配置。本版提供全新 PWA 部署，历史身份或 QQ 记忆迁移需要独立核验的迁移操作与备份。`scripts/pwa-backup.mjs` 只备份 PWA 数据库。完整备份还应覆盖媒体、记忆、配置、服务账号凭据及其他实例资料。

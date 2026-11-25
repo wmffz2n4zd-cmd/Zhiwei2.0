@@ -1,3 +1,4 @@
+import { isPrivateScope, privateEventScope, privateScopeId } from './private-scope.js';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { posix } from 'node:path';
 import { buildLifeObserverReport } from './life-observer.js';
@@ -34,8 +35,9 @@ function sameOriginClient(req) {
 }
 
 /** No timer, writer, model, recovery, or filesystem dependency. */
-export function createLifeObserverHttp({ readSnapshot, now = Date.now, buildReport = buildLifeObserverReport } = {}) {
+export function createLifeObserverHttp({ readSnapshot, readContactPauses, now = Date.now, buildReport = buildLifeObserverReport } = {}) {
   if (typeof readSnapshot !== 'function' || typeof now !== 'function' || typeof buildReport !== 'function') throw TypeError('Observer needs a snapshot reader');
+  if (readContactPauses != null && typeof readContactPauses !== 'function') throw TypeError('Observer needs a pause reader');
   const token = randomBytes(32).toString('hex');
   function validToken(value) {
     return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(token));
@@ -68,6 +70,35 @@ export function createLifeObserverHttp({ readSnapshot, now = Date.now, buildRepo
       return send(res, 200, { token, scope: 'public' });
     }
     if (!validToken(req.headers['x-life-observer-token'])) return send(res, 401, { error: '观察会话已失效，请刷新页面。' });
+    if (url.pathname === '/api/life-observer/contact-pauses') {
+      if (url.search) return send(res, 400, { error: '暂停详情不接受查询参数。' });
+      try {
+        if (!readContactPauses) throw Error('Pause reader unavailable');
+        const captured = readContactPauses();
+        if (!Array.isArray(captured) || captured.length > 512) throw Error('Invalid pause snapshot');
+        const seen = new Set();
+        const contacts = captured.map(item => {
+          if (!item || typeof item !== 'object' || !isPrivateScope(item.scope)
+            || privateScopeId(item.scope) !== item.userId || seen.has(item.scope)
+            || (item.pausedAt !== null && (!Number.isSafeInteger(item.pausedAt) || item.pausedAt < 0 || item.pausedAt > 8640000000000000))
+            || !Number.isSafeInteger(item.expiresAt) || item.expiresAt < 0 || item.expiresAt > 8640000000000000
+            || !['explicit-rule', 'contextual-model', 'legacy-unknown'].includes(item.source)
+            || ![null, 'explicit-stop', 'contextual-impatience'].includes(item.basis)
+            || (item.reason !== null && (typeof item.reason !== 'string' || item.reason.length > 500))
+            || (item.evidence !== null && (typeof item.evidence !== 'string' || !item.evidence.trim() || item.evidence.length > 220))
+            || !['recorded', 'legacy-unavailable', 'removed-by-memory-reset'].includes(item.evidenceStatus)
+            || (item.evidenceStatus === 'recorded') !== (item.evidence !== null)) throw Error('Invalid pause detail');
+          seen.add(item.scope);
+          // Deliberately separate from the public report/export. Project only
+          // this explicit developer contract, never arbitrary contact fields.
+          return { userId: item.userId, scope: item.scope, pausedAt: item.pausedAt, expiresAt: item.expiresAt, source: item.source,
+            basis: item.basis, reason: item.reason, evidence: item.evidence, evidenceStatus: item.evidenceStatus };
+        });
+        return send(res, 200, { at: now(), contacts });
+      } catch {
+        return send(res, 503, { error: '暂时无法读取主动联系暂停详情，请稍后刷新。' });
+      }
+    }
     if (url.pathname !== '/api/life-observer/report') return send(res, 404, { error: '未找到观察入口。' });
     const keys = [...url.searchParams.keys()];
     const date = url.searchParams.get('date') ?? undefined;

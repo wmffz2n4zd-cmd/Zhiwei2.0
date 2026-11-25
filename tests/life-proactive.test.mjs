@@ -11,7 +11,7 @@ const NOW = Date.parse('2026-10-29T06:00:00Z');
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const event = (id, user = '123', text = '以后有空可以来聊聊') => ({ type: 'private_message', senderId: user, text,
   raw: { message_id: id, message: [{ type: 'text', data: { text } }] } });
-const source = (scope, ref = 'memory:known') => ({ kind: 'memory', scope, ref });
+const source = (scope, ref = 'memory:known') => ({ kind: 'private-memory', scope, ref });
 
 async function fixture(t, options = {}) {
   const base = resolve('runtime/tests'); await mkdir(base, { recursive: true });
@@ -100,6 +100,89 @@ test('an existing relationship permits simple spontaneous contact without a fabr
   assert.equal((await d.tick()).kind, 'contact-sent');
   assert.deepEqual(f.inputs[0].sources.map(item => item.kind), ['life-thought', 'relationship']);
   assert.equal(f.inputs[0].relationship.lastIncomingAt, NOW - 20 * MINUTE);
+});
+
+test('both explicit and contextual cooldowns permit a fresh proactive delivery after two hours with no new incoming message', async t => {
+  for (const mode of ['explicit', 'contextual']) await t.test(mode, async t => {
+    const f = await fixture(t);
+    f.plan.status = 'failed';
+    const stopping = event(900, '123', mode === 'explicit' ? '别再找我了' : '你这样说我真的不耐烦了');
+    const token = await f.contacts.observeIncoming(stopping);
+    if (mode === 'contextual') await f.contacts.applyDecision({ token, event: stopping,
+      decision: { action: 'pause', basis: 'contextual-impatience', evidence: stopping.text, reason: '本人当下要求收手' } });
+    const d = f.driver();
+    f.setTime(NOW + 2 * HOUR - 1); f.addPlan();
+    assert.equal((await d.tick()).kind, 'contact-no-candidate');
+    assert.equal(f.inputs.length, 0); assert.equal(f.sent.length, 0);
+    f.setTime(NOW + 2 * HOUR); f.addPlan();
+    const proactive = f.contacts.captureProactive('qq:private:123');
+    assert.equal(f.contacts.isCurrent(proactive), false, 'proactive-only token cannot revive a stopped ordinary reply');
+    assert.equal(f.contacts.isCurrent(proactive, { proactive: true }), true);
+    assert.equal((await d.tick()).kind, 'contact-sent');
+    assert.equal(f.sent.length, 1); assert.equal(f.sent[0].scope, 'qq:private:123');
+    assert.equal(f.contacts.snapshot().contacts[0].sequence, 2, 'no invitation or invented incoming was needed');
+    assert.equal(f.contacts.isCurrent(token), false, 'old stop/pause input remains invalid');
+    assert.equal(f.contacts.snapshot().contacts[0].pauseWindow.expiredAt, NOW + 2 * HOUR);
+    assert.equal(f.inputs[0].sources[1].ref, `incoming:${token.epoch}:${token.sequence}`, 'relationship source cites the actual receipt epoch');
+  });
+});
+
+test('new ordinary incoming cancels cooldown and permits a fresh proactive delivery after the existing quiet window', async t => {
+  const f = await fixture(t); f.plan.status = 'failed';
+  await f.incoming('123', '别再找我了');
+  f.setTime(NOW + 5 * MINUTE);
+  const fresh = await f.incoming('123', '我来聊一件新鲜事');
+  assert.equal(f.contacts.isPaused('qq:private:123'), false);
+  assert.equal(f.contacts.isCurrent(fresh, { proactive: true }), true);
+  f.setTime(NOW + 16 * MINUTE); f.addPlan();
+  assert.equal((await f.driver().tick()).kind, 'contact-sent');
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0].scope, 'qq:private:123');
+});
+
+test('proactive learned selection commits only after confirmed delivery', async t => {
+  for (const outcome of ['delivered', 'declined', 'not-sent', 'uncertain', 'throws']) {
+    await t.test(outcome, async t => {
+      const f = await fixture(t); const order = [];
+      const d = f.driver({
+        decide: async (input, options) => {
+          assert.match(options?.selectionKey || '', /^life-contact:/);
+          options.deferSelection(async () => { order.push('commit'); return { ok: true }; });
+          if (outcome === 'throws') throw Error('model unavailable');
+          return { reply: outcome === 'declined' ? null : '刚画完一张画。',
+            sourceRefs: outcome === 'declined' ? [] : [input.motiveRef, input.sources[1].ref] };
+        },
+        dispatch: async () => { order.push('dispatch'); return { ok: outcome === 'delivered', uncertain: outcome === 'uncertain' }; }
+      });
+      const result = await d.tick();
+      if (outcome === 'delivered') { assert.equal(result.kind, 'contact-sent'); assert.deepEqual(order, ['dispatch', 'commit']); }
+      else { assert.notEqual(result.kind, 'contact-sent'); assert.ok(!order.includes('commit')); }
+    });
+  }
+});
+
+test('a learning commit failure does not undo a delivered proactive contact', async t => {
+  const f = await fixture(t);
+  const d = f.driver({ decide: async (input, options) => {
+    options.deferSelection(async () => { throw Error('sidecar unavailable'); });
+    return { reply: '来聊两句。', sourceRefs: [input.motiveRef, input.sources[1].ref] };
+  } });
+  assert.equal((await d.tick()).kind, 'contact-sent');
+  assert.equal(f.sent.length, 1);
+  assert.equal(d.diagnostics().learningSelection, 'unavailable');
+});
+
+test('the epoch captured with candidate sources reaches generation and transport outside model input', async t => {
+  const f = await fixture(t), epochToken = { scope: 'qq:private:123', epoch: 'captured-before-recall' };
+  const seen = [];
+  const d = f.driver({
+    readCandidate: async () => ({ context: '同对象资料', sources: [], score: 1, epochToken }),
+    decide: async (input, options) => {
+      assert.equal(Object.hasOwn(input, 'epochToken'), false); assert.deepEqual(options.epochToken, epochToken);
+      seen.push('decide'); return { reply: '来聊一会。', sourceRefs: [input.motiveRef, input.sources[1].ref] };
+    },
+    dispatch: async input => { assert.deepEqual(input.epochToken, epochToken); seen.push('dispatch'); return { ok: true }; }
+  });
+  assert.equal((await d.tick()).kind, 'contact-sent'); assert.deepEqual(seen, ['decide', 'dispatch']);
 });
 
 test('no participant consumes the action without any model call or default owner', async t => {
@@ -330,4 +413,128 @@ test('actual timeline observation gap blocks a completed model before the next t
   assert.equal((await d.tick()).kind, 'contact-not-sent'); assert.equal(sends, 0);
   assert.equal(contacts.snapshot().intents[0].status, 'cancelled');
   assert.equal(timeline.snapshot().plans[0].status, 'interrupted');
+});
+
+const readingRef = `note:public:${'d'.repeat(64)}:${'e'.repeat(64)}`;
+const readingSource = { kind: 'reading-note', ref: readingRef };
+
+test('a delayed second model stage can stop before starting when its proactive claim changes', async t => {
+  for (const variant of ['incoming', 'pause', 'busy', 'expired', 'note-removed', 'ineligible', 'closing']) {
+    await t.test(variant, async t => {
+      const f = await fixture(t), started = deferred(), release = deferred();
+      let notesValid = true, eligible = true, writerCalls = 0, closing;
+      const d = f.driver({
+        isEligible: () => eligible,
+        readCandidate: async ({ scope }) => ({ context: '同对象旧阅读资料',
+          sources: [source(scope), readingSource], score: 1 }),
+        validateNoteRefs: async () => notesValid,
+        decide: async (input, options) => {
+          assert.equal(Object.hasOwn(input, 'canContinue'), false, 'guards are not model-visible material');
+          assert.equal(await options.canContinue(), true);
+          started.resolve(); await release.promise;
+          if (!await options.canContinue()) throw Error('Obsolete proactive model stage');
+          writerCalls++;
+          return { reply: '这条不应生成', sourceRefs: [input.motiveRef, input.sources[1].ref] };
+        }
+      });
+      const running = d.tick(); await started.promise;
+      if (variant === 'incoming') await f.incoming('123', '我先来聊新话题');
+      if (variant === 'pause') await f.incoming('123', '别烦我');
+      if (variant === 'busy') f.setBusy(true);
+      if (variant === 'expired') f.setTime(NOW + HOUR);
+      if (variant === 'note-removed') notesValid = false;
+      if (variant === 'ineligible') eligible = false;
+      if (variant === 'closing') closing = d.close();
+      release.resolve();
+      assert.equal((await running).kind, 'contact-decision-failed');
+      if (closing) await closing;
+      assert.equal(writerCalls, 0); assert.equal(f.sent.length, 0);
+      assert.ok(f.contacts.snapshot().intents.every(intent => !['ready', 'sending', 'sent'].includes(intent.status)));
+    });
+  }
+});
+
+test('a proactive continuation guard rechecks the recipient after asynchronous source validation', async t => {
+  const f = await fixture(t), checking = deferred(), release = deferred();
+  let modelEntered = false, writerCalls = 0;
+  const d = f.driver({
+    readCandidate: async ({ scope }) => ({ context: '旧札记', sources: [source(scope), readingSource], score: 1 }),
+    validateNoteRefs: async () => {
+      if (modelEntered) { checking.resolve(); await release.promise; }
+      return true;
+    },
+    decide: async (input, options) => {
+      modelEntered = true;
+      if (!await options.canContinue()) throw Error('Recipient changed while validating source');
+      writerCalls++;
+      return { reply: '这条不应生成', sourceRefs: [input.motiveRef, input.sources[1].ref] };
+    }
+  });
+  const running = d.tick(); await checking.promise;
+  await f.incoming('123', '现在来聊别的话题'); release.resolve();
+  assert.equal((await running).kind, 'contact-decision-failed');
+  assert.equal(writerCalls, 0); assert.equal(f.sent.length, 0);
+});
+
+test('an old note reaches only the selected contact and carries source validation to model and dispatch', async t => {
+  const f = await fixture(t, { users: ['123', '456'] }); let modelOptions, dispatchNotes;
+  const d = f.driver({
+    readCandidate: async ({ scope }) => ({ context: scope.endsWith('456') ? '记录于2020年：OLD_SELECTED_NOTE' : 'OTHER_NOTE',
+      sources: [source(scope), readingSource], score: scope.endsWith('456') ? 2 : 1 }),
+    validateNoteRefs: async refs => refs.every(ref => ref === readingRef),
+    decide: async (input, options) => { f.inputs.push(input); modelOptions = options;
+      return { reply: '想起以前看过的鸟鸣札记，突然有点想再去辨一辨。', sourceRefs: [input.motiveRef, input.sources[1].ref, readingRef] }; },
+    dispatch: async ({ ticket, scope, guard, noteRefs }) => { dispatchNotes = noteRefs;
+      return f.contacts.dispatch(ticket, async text => { f.sent.push({ scope, text }); return { ok: true }; }, { guard }); }
+  });
+  assert.equal((await d.tick()).kind, 'contact-sent'); assert.equal(f.inputs.length, 1);
+  assert.match(f.inputs[0].context, /OLD_SELECTED_NOTE/); assert.ok(!JSON.stringify(f.inputs[0]).includes('OTHER_NOTE'));
+  assert.deepEqual(modelOptions.noteRefs, [readingRef]); assert.deepEqual(dispatchNotes, [readingRef]);
+  assert.ok(f.contacts.snapshot().intents[0].selectedSourceRefs.includes(readingRef));
+});
+
+test('a private reading note cannot replace evidence of a relationship with the recipient', () => {
+  const scope = 'qq:private:123', note = { kind: 'reading-note', ref: readingRef.replace('public', 'f'.repeat(16)), scope };
+  const input = { scope, motiveRef: 'thought:1', sources: [{ kind: 'life-thought', ref: 'thought:1' }, note] };
+  assert.throws(() => parseProactiveDecision({ reply: '想来聊聊', sourceRefs: ['thought:1', note.ref] }, input), /current-object evidence/);
+});
+
+test('a cleared note-derived motive cannot be laundered through an intermediate thought', async t => {
+  const f = await fixture(t);
+  f.snapshot.thoughts.push({ id: 'prior-note-thought', source: { kind: 'life-planner', ref: JSON.stringify([readingRef]) } });
+  f.snapshot.thoughts[0].source.ref = '["thought:prior-note-thought"]';
+  const d = f.driver({ validateNoteRefs: async () => false });
+  assert.equal((await d.tick()).kind, 'contact-source-unavailable');
+  assert.equal(f.reads.length, 0); assert.equal(f.inputs.length, 0); assert.equal(f.sent.length, 0);
+});
+
+test('deleting a recalled note during generation prevents the late reply from being queued for send', async t => {
+  const f = await fixture(t); let current = true, dispatched = false;
+  const d = f.driver({ readCandidate: async ({ scope }) => ({ context: '以前记下的阅读感想', sources: [source(scope), readingSource], score: 1 }),
+    validateNoteRefs: async () => current,
+    decide: async input => { current = false; return { reply: '这条已经依赖失效札记', sourceRefs: [input.motiveRef, input.sources[1].ref, readingRef] }; },
+    dispatch: async () => { dispatched = true; return { ok: true }; } });
+  assert.equal((await d.tick()).kind, 'contact-source-unavailable');
+  assert.equal(dispatched, false); assert.equal(f.sent.length, 0);
+  assert.equal(f.contacts.snapshot().intents[0].status, 'failed');
+});
+
+test('a note removed while the ready claim is persisted is cancelled without a transport attempt', async t => {
+  const f = await fixture(t); let current = true, dispatched = false;
+  const d = f.driver({ contacts: { ...f.contacts, completeGeneration: async (...args) => {
+    const result = await f.contacts.completeGeneration(...args); current = false; return result;
+  } }, readCandidate: async ({ scope }) => ({ context: '旧札记', sources: [source(scope), readingSource], score: 1 }),
+    validateNoteRefs: async () => current,
+    dispatch: async () => { dispatched = true; return { ok: true }; } });
+  assert.equal((await d.tick()).kind, 'contact-source-unavailable');
+  assert.equal(dispatched, false); assert.equal(f.contacts.snapshot().intents[0].status, 'cancelled');
+});
+
+test('a profile-only motive still checks notes that were offered to its planning model', async t => {
+  const f = await fixture(t);
+  f.snapshot.thoughts[0].source.ref = '["profile"]';
+  f.snapshot.thoughts[0].basis = { offeredRefs: ['profile', readingRef], selectedRefs: ['profile'] };
+  const d = f.driver({ validateNoteRefs: async () => false });
+  assert.equal((await d.tick()).kind, 'contact-source-unavailable');
+  assert.equal(f.reads.length, 0); assert.equal(f.inputs.length, 0); assert.equal(f.sent.length, 0);
 });

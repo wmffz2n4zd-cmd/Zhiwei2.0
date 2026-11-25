@@ -1,0 +1,46 @@
+{
+  "assistantName": "知微",
+  "assistantProfile": "config/zhiwei-profile.md",
+  "workspace": "workspaces/remote",
+  "remoteEnabled": false,
+  "allowFullAccessTasks": false,
+  "chatModel": "gpt-6.1-terra",
+  "chatReasoningEffort": "medium",
+  "privateReplyMode": "single",
+  "webLookup": true,
+  "pwa": {
+    "enabled": true,
+    "origin": "https://chat.example.org",
+    "port": 3790,
+    "pushEnabled": true,
+    "spaceEnabled": true,
+    "privateThoughtsEnabled": true,
+    "privateThoughtActionsEnabled": true,
+    "creativeTools": {
+      "drawing": true,
+      "website": true,
+      "design": true,
+      "model3d": true,
+      "programWebsite": true
+    }
+  },
+  "life": {
+    "enabled": true,
+    "tickIntervalMs": 15000,
+    "planning": {
+      "enabled": false
+    }
+  },
+  "world": {
+    "enabled": true,
+    "autoEnabled": false,
+    "channel": "chromium",
+    "headless": true
+  },
+  "privateLearning": {
+    "enabled": true
+  },
+  "runtimeBudget": {
+    "mode": "observe"
+  }
+}

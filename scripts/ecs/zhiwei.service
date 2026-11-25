@@ -1,0 +1,22 @@
+[Unit]
+Description=Zhiwei private chat and personal timeline
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zhiwei
+Group=zhiwei
+WorkingDirectory=/srv/zhiwei
+Environment=HOME=/home/zhiwei
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/zhiwei.env
+ExecStart=/usr/bin/env node src/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=660
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

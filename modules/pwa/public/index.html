@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#214c41">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="知微">
+  <meta name="referrer" content="no-referrer">
+  <title>知微</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="stylesheet" href="/app.v1.css?v=s153">
+  <script type="module" src="/app.v1.js?v=s153"></script>
+</head>
+<body>
+  <main id="gate" class="gate">
+    <section class="welcome" aria-labelledby="welcome-title">
+      <img src="/icon.svg" alt="" width="64" height="64" class="brand-icon">
+      <p class="eyebrow">一方小小的天地</p>
+      <h1 id="welcome-title">知微</h1>
+      <p id="gate-copy" class="muted">正在确认登录状态…</p>
+      <form id="auth-form" hidden>
+        <label id="username-field">账号<input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" minlength="3" maxlength="32" pattern="[a-z0-9][a-z0-9_.\-]{2,31}" required><span id="username-help" class="fine-print" hidden>3–32 位小写字母、数字、点、下划线或短横线，以字母或数字开头。</span></label>
+        <label id="display-name-field" hidden>怎么称呼你<input id="display-name" name="displayName" autocomplete="nickname" maxlength="40"></label>
+        <label>密码<input id="password" name="password" type="password" autocomplete="current-password" minlength="10" maxlength="256" required></label>
+        <button id="auth-submit" type="submit" class="primary">登录</button>
+        <button id="auth-login-mode" type="button" class="secondary" hidden>已有账号，去登录</button>
+        <p id="auth-error" class="form-error" role="alert"></p>
+      </form>
+      <button id="gate-retry" type="button" class="secondary" hidden>重新连接</button>
+      <p id="invite-note" class="fine-print">这里仅向受邀的朋友开放。已有账号可直接登录；首次使用请打开邀请链接。</p>
+      <details class="install-help"><summary>放到手机主屏幕</summary><p>在 iPhone 的 Safari 中打开，点“分享”→“添加到主屏幕”。从桌面图标进入后，再开启通知。需要 iOS 16.4 或更新版本。</p></details>
+    </section>
+  </main>
+
+  <main id="chat-app" class="chat-app" hidden>
+    <header class="chat-header">
+      <img src="/icon.svg" alt="" width="42" height="42" class="avatar">
+      <div class="chat-heading"><h1>知微</h1><p id="connection-status" aria-live="polite">连接中</p></div>
+      <a id="space-open" class="space-nav" href="/space" data-page-link hidden>空间</a>
+      <button id="history-open" class="icon-button" type="button" aria-label="查找聊天记录"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg></button>
+      <button id="settings-open" class="icon-button" type="button" aria-label="打开设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg></button>
+    </header>
+    <aside id="install-banner" class="banner" hidden><span>把知微放到主屏幕，聊完也能收到提醒。</span><button id="install-info" type="button">怎么安装</button></aside>
+    <aside id="update-banner" class="banner" hidden><span>有新版本，草稿会为你保留。</span><button id="update-now" type="button">更新</button></aside>
+    <aside id="account-pending" class="banner" hidden>账号已建立，旧资料关联正在等待管理员核对。核对完成后即可聊天。</aside>
+    <section id="timeline" class="timeline" aria-label="与知微的聊天">
+      <button id="load-history" class="history-button" type="button" hidden>查看更早的消息</button>
+      <p id="empty-chat" class="empty-chat">想说什么，都可以从这里开始。</p>
+      <div id="messages" role="log" aria-live="polite" aria-relevant="additions"></div>
+      <div id="pending-messages" aria-live="polite"></div>
+    </section>
+    <button id="unread-jump" type="button" class="unread-jump" hidden>回到最新消息</button>
+    <section class="compose-area" aria-label="发送消息">
+      <div id="reply-preview" class="reply-preview" hidden><button id="reply-copy" class="reply-location" type="button" aria-label="查看引用原文"></button><button id="cancel-reply" type="button" aria-label="取消引用">×</button></div>
+      <div id="attachments" class="attachments"></div>
+      <form id="message-form" class="message-form">
+        <button id="attach-button" class="icon-button" type="button" aria-label="添加图片"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 5-5 4 4 4-6 5 7"/></svg></button>
+        <button id="sticker-open" class="icon-button" type="button" aria-label="选择表情"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 14c1.5 3 6.5 3 8 0M8 9h.01M16 9h.01"/></svg></button>
+        <input id="file-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden>
+        <textarea id="composer" rows="1" maxlength="16000" aria-label="消息" placeholder="和知微说点什么…"></textarea>
+        <button id="send-button" class="send-button" type="submit" aria-label="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7M12 5v14"/></svg></button>
+      </form>
+      <p id="composer-status" class="composer-status" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <main id="space-app" class="chat-app" hidden aria-labelledby="space-title">
+    <header class="chat-header">
+      <img src="/icon.svg" alt="" width="42" height="42" class="avatar">
+      <div class="chat-heading"><h1 id="space-title" tabindex="-1">知微的空间</h1><p>登录用户可见</p></div>
+      <a class="space-nav" href="/" data-page-link>私聊</a>
+      <button id="space-settings" class="icon-button" type="button" aria-label="打开设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg></button>
+    </header>
+    <section id="space-feed" class="space-feed" aria-label="空间动态">
+      <div class="space-controls">
+        <a id="space-all" class="space-nav" href="/space" data-page-link hidden>‹ 全部动态</a>
+        <button id="space-refresh" class="space-nav" type="button">刷新</button>
+      </div>
+      <div id="space-posts"></div>
+      <p id="space-status" class="space-status" role="status"></p>
+      <section id="space-comments" aria-labelledby="comments-title" hidden>
+        <h2 id="comments-title">评论</h2>
+        <form id="comment-form">
+          <label for="comment-text">写评论</label>
+          <textarea id="comment-text" maxlength="1000" rows="2" aria-describedby="comment-audience"></textarea>
+          <div class="comment-actions">
+            <small id="comment-audience">所有登录用户可见</small>
+            <button id="comment-submit" type="submit" class="primary" disabled>发表评论</button>
+          </div>
+        </form>
+        <p id="comment-send-status" class="comment-status" role="status"></p>
+        <ol id="comment-list" aria-label="动态下的评论"></ol>
+        <p id="comment-list-status" class="comment-status" role="status"></p>
+        <button id="comment-more" type="button" class="secondary" hidden>查看更早的评论</button>
+      </section>
+      <button id="space-more" class="secondary" type="button" hidden>查看更早的动态</button>
+    </section>
+  </main>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <header><h2>设置</h2><button id="settings-close" class="icon-button" type="button" aria-label="关闭设置">×</button></header>
+    <p id="account-name" class="account-name"></p>
+    <section><h3>消息通知</h3><p id="push-status" class="muted">尚未开启</p><button id="enable-push" type="button" class="primary">开启通知</button><button id="disable-push" type="button" class="secondary" hidden>关闭此设备通知</button><label class="switch-row"><input id="notification-preview" type="checkbox">锁屏通知中显示消息摘要</label><p class="fine-print">默认只提醒有新消息。通知是否及时显示，也受手机网络、专注模式和系统设置影响。</p></section>
+    <section><h3>添加到主屏幕</h3><p class="muted">iPhone：用 Safari 打开，点“分享”→“添加到主屏幕”，再从桌面图标进入。安装后可能需要重新登录。</p></section>
+    <section><h3>这次聊天</h3><p class="muted">消息保存后可在其他设备登录查看。聊天内容和图片不会被离线缓存；待发草稿仅保存在当前账号的设备里，退出时清除。</p></section>
+    <button id="legacy-open" type="button" class="secondary" hidden>查找留存的 QQ 记录</button>
+    <button id="logout-button" type="button" class="secondary logout">退出登录</button>
+    <p id="settings-error" class="form-error" role="alert"></p>
+    <p class="version">知微 · 邀请制私聊</p>
+  </dialog>
+  <dialog id="history-dialog" class="settings-dialog history-dialog" aria-labelledby="history-title">
+    <header><h2 id="history-title">聊天记录</h2><button id="history-close" class="icon-button" type="button" aria-label="关闭聊天记录">×</button></header>
+    <p class="fine-print">查找这次聊天和已关联的旧留存。这里只展示实际保存的内容，旧 QQ 记录不一定完整。</p>
+    <form id="history-form" class="history-form">
+      <label class="history-keyword">关键词<input id="history-query" type="search" maxlength="200" placeholder="想找哪句话？" autocomplete="off"></label>
+      <div class="history-dates"><label>开始日期<input id="history-from" type="date"></label><label>结束日期<input id="history-to" type="date"></label></div>
+      <div class="history-filters"><label>谁说的<select id="history-speaker"><option value="all">全部</option><option value="user">你</option><option value="assistant">知微</option></select></label><label>记录来源<select id="history-source"><option value="all">全部记录</option><option value="pwa">网页聊天</option><option value="qq">QQ 留存</option></select></label></div>
+      <button id="history-submit" class="primary" type="submit">查找</button>
+    </form>
+    <p id="history-status" class="fine-print" role="status"></p>
+    <div id="history-results" class="history-results"></div>
+    <button id="history-more" class="secondary" type="button" hidden>更多结果</button>
+  </dialog>
+  <dialog id="context-dialog" class="settings-dialog history-dialog" aria-labelledby="context-title">
+    <header><h2 id="context-title">原文与上下文</h2><button id="context-close" class="icon-button" type="button" aria-label="关闭原文">×</button></header>
+    <p id="context-status" class="fine-print" role="status"></p>
+    <div id="context-records" class="history-results"></div>
+  </dialog>
+  <dialog id="sticker-dialog" class="settings-dialog sticker-dialog" aria-labelledby="sticker-title">
+    <header><h2 id="sticker-title">表情</h2><button id="sticker-close" class="icon-button" type="button" aria-label="关闭表情">×</button></header>
+    <div class="sticker-tabs" role="group" aria-label="表情分类"><button data-sticker-view="favourites" type="button" aria-pressed="true">我的收藏</button><button data-sticker-view="recent" type="button" aria-pressed="false">最近使用</button><button data-sticker-view="shared" type="button" aria-pressed="false">知微的表情</button></div>
+    <p id="sticker-status" class="fine-print" role="status"></p>
+    <div id="sticker-grid" class="sticker-grid"></div>
+    <button id="sticker-more" class="secondary" type="button" hidden>更多表情</button>
+    <button id="sticker-upload" class="secondary" type="button">上传表情到收藏</button>
+    <input id="sticker-file" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden>
+    <p class="fine-print">选好后可直接发送，也可以添一句话。你的收藏仅自己可见。</p>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

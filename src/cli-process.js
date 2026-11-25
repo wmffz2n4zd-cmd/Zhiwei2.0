@@ -3,21 +3,54 @@ import { spawn } from 'node:child_process';
 // Only chat replies may return early. Remote jobs still wait for process exit.
 // A final message alone is insufficient: the JSON turn must also complete.
 export function runCliProcess({ command, args, cwd, env, input, timeout = 300000,
-  earlyReply = false, cleanupMs = 5000, onExit = () => {} }) {
+  earlyReply = false, cleanupMs = 5000, onExit = () => {}, onSpawn = () => {}, signal, abortGraceMs = 1000 }) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
-    const child = spawn(command, args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', lineBuffer = '', replyText = '', settled = false, turnFailed = false, closed = false, stderrTail = '';
-    let cleanupTimer;
+    let cleanupTimer, abortTimer, aborting = false;
     let reportedUsage = null, usageMissing = false;
     const cliTiming = { replyReadyMs: null, processExitMs: null, exitTailMs: null, retries: 0, httpFallbacks: 0 };
     const result = () => ({ stdout, stderr, replyText, cliTiming, usage: usageMissing ? null : reportedUsage });
+    const superseded = () => Object.assign(new Error('Reply generation superseded by newer input'), result(),
+      { name: 'AbortError', code: 'REPLY_SUPERSEDED' });
+    // Do not launch an already obsolete attempt. No process exists to report
+    // through onExit; the caller's rejected-start path releases its reservation.
+    if (signal?.aborted) { reject(superseded()); return; }
+    // Launchers can have descendants even without an AbortSignal. Give every
+    // POSIX attempt its own group for bounded timeout and tail cleanup.
+    const ownProcessGroup = process.platform !== 'win32';
+    const child = spawn(command, args, { cwd, env, windowsHide: true,
+      detached: ownProcessGroup, stdio: ['pipe', 'pipe', 'pipe'] });
+    const killAttempt = kind => {
+      if (ownProcessGroup && Number.isInteger(child.pid) && child.pid > 0) {
+        try { process.kill(-child.pid, kind); }
+        catch (error) {
+          if (error.code !== 'ESRCH') {
+            stderr = (stderr + `\nProcess-group termination failed (${error.code || 'unknown'}); trying the child.`).slice(-8000);
+            try { child.kill(kind); } catch { /* Keep ownership until the actual close event. */ }
+          }
+        }
+      } else { try { child.kill(kind); } catch { /* A failed signal must not escape a timer callback. */ } }
+    };
+    const terminateAttempt = () => {
+      killAttempt('SIGTERM');
+      const grace = Number.isFinite(abortGraceMs) ? Math.max(0, Math.min(5000, abortGraceMs)) : 1000;
+      abortTimer = setTimeout(() => { if (!closed) killAttempt('SIGKILL'); }, grace);
+    };
+    const removeAbortListener = () => signal?.removeEventListener('abort', abort);
+    const abort = () => {
+      if (settled || closed || aborting) return;
+      aborting = true; clearTimeout(timer); removeAbortListener();
+      // Keep the promise pending until the old process actually closes, so a
+      // replacement does not overlap it. Escalate only this attempt if needed.
+      terminateAttempt();
+    };
     const succeedEarly = () => {
-      if (settled || closed || turnFailed || !earlyReply || !replyText.trim()) return;
-      settled = true; clearTimeout(timer);
+      if (settled || closed || aborting || turnFailed || !earlyReply || !replyText.trim()) return;
+      settled = true; clearTimeout(timer); removeAbortListener();
       cliTiming.replyReadyMs = Date.now() - startedAt;
       // The turn has completed, so only CLI shutdown/telemetry remains.
-      cleanupTimer = setTimeout(() => child.kill(), cleanupMs);
+      cleanupTimer = setTimeout(terminateAttempt, cleanupMs);
       cleanupTimer.unref();
       resolve(result());
     };
@@ -44,7 +77,8 @@ export function runCliProcess({ command, args, cwd, env, input, timeout = 300000
     };
     const timer = setTimeout(() => {
       if (settled) return;
-      settled = true; child.kill();
+      settled = true; removeAbortListener();
+      terminateAttempt();
       const error = new Error('Codex CLI timed out while generating a reply');
       Object.assign(error, result(), { code: 'ETIMEDOUT' }); reject(error);
     }, timeout);
@@ -68,25 +102,40 @@ export function runCliProcess({ command, args, cwd, env, input, timeout = 300000
       stderrTail = combined.slice(-100);
     });
     child.on('error', error => {
-      clearTimeout(timer); clearTimeout(cleanupTimer);
+      clearTimeout(timer); clearTimeout(cleanupTimer); removeAbortListener();
+      // An abort is settled at close, including a kill error, instead of being
+      // mislabeled as a model failure or releasing a still-running process.
+      if (aborting) return;
+      clearTimeout(abortTimer);
       if (!settled) { settled = true; reject(error); }
     });
     child.on('close', code => {
       closed = true;
+      // A launcher can exit after closing its own pipes while descendants still
+      // exist, even after a successful exit. Reap only this dedicated group
+      // before onExit releases temporary output ownership.
+      if (ownProcessGroup) killAttempt('SIGKILL');
       if (lineBuffer.trim()) parseLine(lineBuffer);
-      clearTimeout(timer); clearTimeout(cleanupTimer);
+      clearTimeout(timer); clearTimeout(cleanupTimer); clearTimeout(abortTimer); removeAbortListener();
       cliTiming.processExitMs = Date.now() - startedAt;
       cliTiming.exitTailMs = cliTiming.replyReadyMs == null ? null : Math.max(0, cliTiming.processExitMs - cliTiming.replyReadyMs);
       try { onExit({ ...cliTiming, code }); } catch { /* Diagnostics must not break delivery. */ }
       if (settled) return;
       settled = true;
-      if (code === 0 && !turnFailed) resolve(result());
+      if (aborting) reject(superseded());
+      else if (code === 0 && !turnFailed) resolve(result());
       else {
         const error = new Error(`Codex CLI exited ${code}`);
         Object.assign(error, result(), { code }); reject(error);
       }
     });
+    signal?.addEventListener('abort', abort, { once: true });
+    // Close the race between the first check and installing the listener.
+    if (signal?.aborted) abort();
     child.stdin.on('error', () => {});
-    child.stdin.end(input);
+    if (Number.isInteger(child.pid) && child.pid > 0) {
+      try { onSpawn(); } catch { /* Observer callbacks cannot orphan a child. */ }
+    }
+    child.stdin.end(aborting ? '' : input);
   });
 }

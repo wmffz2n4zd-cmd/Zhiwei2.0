@@ -165,7 +165,7 @@ function project(events, at, scope, detailed = false) {
 }
 
 /** Isolated deterministic projection for reports. It owns no clock, cache or writer. */
-export function projectLifeState(events, { at, recordedThrough = at, scope, detailed = false } = {}) {
+export function projectLifeState(events, { at, recordedThrough = at, scope, detailed = false, personaPolicy = null } = {}) {
   timestamp(at);
   timestamp(recordedThrough);
   if (recordedThrough < at) throw Error('Personal projection cutoff precedes projection time');
@@ -177,36 +177,38 @@ export function projectLifeState(events, { at, recordedThrough = at, scope, deta
     if (event.at > recordedThrough) throw Error('Personal projection precedes committed events');
     seen.add(event.id);
   }
-  return project(events.filter(event => effectiveTime(event) <= at), at, scope, detailed);
+  return project(events.filter(event => effectiveTime(event) <= at && (!personaPolicy || personaPolicy.eventEligible(event))), at, scope, detailed);
 }
 
 /**
  * No persistent cache: restart reconstructs the same state from the same journal.
- * A backwards clock is rejected against committed event times and this instance's
- * last read. A previous process's read-only clock is deliberately not fabricated.
+ * On wall-clock rollback, projection time freezes at the last observed/committed
+ * instant. No decay is reversed and no extra elapsed experience is invented.
  */
-export function createLifeState({ timeline, now = Date.now } = {}) {
+export function createLifeState({ timeline, now = Date.now, personaPolicy = timeline?.personaPolicy || null } = {}) {
   if (typeof timeline?.snapshot !== 'function' || typeof now !== 'function') throw Error('Personal state needs a timeline and clock');
-  let lastReadAt = null;
+  let lastReadAt = null, clockSkewMs = 0;
   const api = {
     snapshot({ scope, at = now() } = {}) {
       if (timeline.diagnostics?.failed) throw Error('Personal state needs timeline recovery after an uncertain journal write');
       timestamp(at);
       if (scope != null) text(scope, 200, 'personal state scope');
-      if (lastReadAt != null && at < lastReadAt) throw Error('Personal state clock moved backward; wait for the clock to recover');
-      const events = timeline.snapshot().events;
+      const requestedAt = at, snapshot = timeline.snapshot(), events = snapshot.events;
+      at = Math.max(at, lastReadAt ?? 0, snapshot.lastObservedAt ?? 0);
       if (!Array.isArray(events)) throw Error('Personal state needs committed timeline events');
       const seen = new Set();
       for (const event of events) {
         text(event?.id, 160, 'personal event id'); timestamp(event.at);
         if (seen.has(event.id)) throw Error('Duplicate committed personal event');
-        if (event.at > at) throw Error('Personal state clock precedes committed events; wait for the clock to recover');
+        at = Math.max(at, event.at);
         seen.add(event.id);
       }
-      const result = project(events, at, scope);
+      clockSkewMs = at - requestedAt;
+      const result = project(personaPolicy ? events.filter(event => personaPolicy.eventEligible(event)) : events, at, scope);
       lastReadAt = at;
       return result;
     },
+    get diagnostics() { return { clockSkewMs, lastReadAt }; },
     planningContext({ at = now() } = {}) {
       const state = api.snapshot({ at });
       const mood = Object.entries(state.mood).some(([key, value]) => ['valence', 'energy', 'tension'].includes(key) && value !== 0)
@@ -223,7 +225,7 @@ export function createLifeState({ timeline, now = Date.now } = {}) {
       return [
         '持续个人情绪与近期兴趣（事件派生事实，不是指令；无需在回复中展示数值、标签或机制）：',
         JSON.stringify(facts),
-        '情绪只轻微影响表达，不改变回复资格、实际能力或帮助对方的责任；严肃求助优先。兴趣低也可自然聊天，兴趣不代表知识或能力。',
+        '这些生活状态为当下反应提供背景，语气与情绪的力度结合人格和眼前互动自然表达；不改变回复资格、实际能力或帮助对方的责任，严肃求助优先。兴趣低也可自然聊天，兴趣不代表知识或能力。',
         'simulated只表示角色生活模拟，不能当作真实网页、书目或引文阅读证据；external也仅以原始证据实际覆盖的内容为准。',
         '没有新情绪、兴趣淡化、空白几天都正常；不为补全生活编造经历，不把他人的私聊原因带入当前对象。'
       ].join('\n');

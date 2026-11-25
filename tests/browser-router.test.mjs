@@ -41,7 +41,7 @@ test('default behavior retains the injected single reader when no X profile is c
 
 test('X aliases use the dedicated profile; default pages and lookalike hosts keep the original profile', async t => {
   const f = await fixture(t);
-  for (const url of ['https://x.com/home', 'https://www.x.com/search?q=test', 'https://twitter.com/person/status/123',
+  for (const url of ['https://x.com/home', 'https://www.x.com/person/status/123', 'https://twitter.com/person/status/123',
     'https://www.twitter.com/home', 'https://mobile.twitter.com/home', 'https://mobile.x.com/home', 'https://X.COM./home']) {
     assert.equal((await f.router.read(url)).text, 'x');
   }
@@ -77,7 +77,7 @@ test('login globally blocks reads, searches and another platform until finishLog
   assert.equal((await f.router.finishLogin()).mode, 'read');
   await f.router.openLogin('xhs'); assert.equal(f.router.status().platform, 'default');
   await f.router.finishLogin(); await f.router.search('test', { platform: 'x' });
-  assert.equal(f.router.status().platform, 'x');
+  assert.equal(f.router.status().platform, 'default');
 });
 
 test('close failure retains the original profile and blocks creation of another browser', async t => {
@@ -113,8 +113,11 @@ test('platform search and login selection reject unsupported names without launc
   await assert.rejects(f.router.search('test', { platform: 'arbitrary' }), /只支持/);
   await assert.rejects(f.router.openLogin('arbitrary'), /只支持/);
   assert.equal(f.made.length, 0);
-  await f.router.search('test', { platform: 'twitter' }); assert.equal(f.router.status().platform, 'x');
-  await f.router.search('test', { platform: 'xiaohongshu' }); assert.equal(f.router.status().platform, 'default');
+  for (const platform of [undefined, 'web', 'x', 'twitter', 'xiaohongshu']) {
+    await f.router.search('test', { platform }); assert.equal(f.router.status().platform, 'default');
+    assert.deepEqual(f.calls.at(-1), ['default', 'search', 'test', { platform: 'xiaohongshu' }]);
+  }
+  assert.equal(f.made.length, 1);
 });
 
 test('configuration rejects overlapping profiles or screenshots and any unreviewed X POST endpoint', async t => {
@@ -132,7 +135,7 @@ test('configuration rejects overlapping profiles or screenshots and any unreview
 test('symlink aliases through an existing ancestor cannot select overlapping profile locations', async t => {
   const f = await fixture(t);
   const actual = join(f.directory, 'actual'), alias = join(f.directory, 'alias');
-  await mkdir(actual); await symlink(actual, alias, 'dir');
+  await mkdir(actual); await symlink(actual, alias, process.platform === 'win32' ? 'junction' : 'dir');
   const router = createBrowserRouter({ browserFactory: f.browserFactory,
     defaultOptions: { ...f.defaultOptions, profileDir: join(actual, 'profile') },
     xOptions: { ...f.xOptions, profileDir: join(alias, 'profile') } });

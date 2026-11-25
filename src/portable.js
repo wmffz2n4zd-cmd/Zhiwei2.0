@@ -1,7 +1,8 @@
 import { homedir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { readJsonRecoverableSync } from './atomic-file.js';
+import { privateEventScope } from './private-scope.js';
 
 export const isMac = process.platform === 'darwin';
 export const userHome = homedir();
@@ -53,19 +54,13 @@ export function codexCommand(path, args) {
   }
   return /\.m?js$/i.test(path) ? { command: process.execPath, args: [path, ...args] } : { command: path, args };
 }
-// `data/local.json` is the documented deployment configuration. The historical
-// `data/windows.local.json` name is still accepted when it is the only file
-// present, so existing installations and test fixtures keep working.
-export function localConfigPath(projectDir, env = process.env) {
-  if (env.ZHIWEI_CONFIG) return isAbsolute(env.ZHIWEI_CONFIG) ? env.ZHIWEI_CONFIG : resolve(projectDir, env.ZHIWEI_CONFIG);
-  const preferred = join(projectDir, 'data', 'local.json');
-  const legacy = join(projectDir, 'data', 'windows.local.json');
-  return !existsSync(preferred) && existsSync(legacy) ? legacy : preferred;
-}
 export function loadLocalConfig(projectDir) {
-  const path = localConfigPath(projectDir);
-  const config = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : {};
-  if (config.ownerUserIds && (!Array.isArray(config.ownerUserIds) || config.ownerUserIds.some(id => !/^\d{5,20}$/.test(String(id))))) throw new Error('ownerUserIds 必须是 QQ 号数组');
+  const path = join(projectDir, 'data', 'windows.local.json');
+  const config = readJsonRecoverableSync(path, { warn: message => console.warn(message) });
+  // Preserve the on-disk file and all shared settings. Retired transport and
+  // numeric admission fields are not runtime authority for a PWA account.
+  for (const key of ['qqEnabled', 'qqPrivateOnly', 'oneBotSecret', 'oneBotAccessToken', 'oneBotApiBase',
+    'ownerUserIds', 'privateChatUserIds', 'allowOtherPrivateChats', 'qqImageCacheRoots']) delete config[key];
   const workspace = config.workspace || 'workspaces/remote';
   return { ...config, workspace: isAbsolute(workspace) ? workspace : resolve(projectDir, workspace) };
 }
@@ -93,13 +88,6 @@ export function skillContext(skills, key) {
   if (!path) throw new Error(`未知 Skill：${key}`);
   return `使用以下 Skill。相对引用以 ${dirname(path)} 为基准。人物视角是公开资料的提炼，不是真人。\n${readFileSync(path, 'utf8')}`;
 }
-export function validSignature(raw, signature, secret) {
-  if (!secret || typeof signature !== 'string') return false;
-  const expected = 'sha1=' + createHmac('sha1', secret).update(raw).digest('hex');
-  const a = Buffer.from(expected), b = Buffer.from(signature);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
 // Each owner has an independent pending task, conversation and selected Skill.
 export class PrivateTasks {
   constructor({ run, skills, enabled, allowFullAccess = false, now = Date.now }) {
@@ -112,7 +100,8 @@ export class PrivateTasks {
     const command = /^\/(执行|执行完全访问|远程执行|确认|取消|技能|帮助|清空任务记忆)(?:\s|$)/.test(text);
     if (!command) return null;
     if (!event.isOwner || event.type !== 'private_message') return '这些指令仅允许管理员私聊使用。';
-    const id = String(event.senderId);
+    let id;
+    try { id = privateEventScope(event); } catch { return '任务需要有效的管理员私聊对象。'; }
     if (!this.users.has(id)) this.users.set(id, { skill: 'none', pending: null, history: [] });
     const session = this.users.get(id);
     session.skill = resolveChatSkill(this.skills, session.skill);
@@ -125,7 +114,7 @@ export class PrivateTasks {
       if (key !== 'none' && !Object.hasOwn(this.skills, key)) return '未知 Skill，请发 /技能 查看列表。';
       session.skill = key; return `已选择 ${key}。`;
     }
-    if (!this.enabled) return '远程执行未启用。请先在本机完成管理员和 OneBot 回调密钥配置。';
+    if (!this.enabled) return '远程执行未启用。请由部署者配置网页管理员权限并开启 remoteEnabled。';
     if (/^\/(执行|执行完全访问)\s/.test(text)) {
       const fullAccess = text.startsWith('/执行完全访问 ');
       if (fullAccess && !this.allowFullAccess) return '完全访问未在本机启用。普通任务请使用 /执行；本机 allowFullAccessTasks=true 后才接受完全访问任务。';
@@ -155,7 +144,9 @@ export class PrivateTasks {
   }
   chatSkill(event) {
     if (!event.isOwner || event.type !== 'private_message') return null;
-    const session = this.users.get(String(event.senderId));
+    let scope;
+    try { scope = privateEventScope(event); } catch { return null; }
+    const session = this.users.get(scope);
     if (!session) return null;
     session.skill = resolveChatSkill(this.skills, session.skill);
     return session.skill;

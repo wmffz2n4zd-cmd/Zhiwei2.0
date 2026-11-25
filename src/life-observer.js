@@ -141,6 +141,35 @@ function related(relations, ref, topic, after = 0) {
   });
 }
 
+function safeOperations(input) {
+  if (!plain(input)) return null;
+  const result = {};
+  const booleans = ['enabled', 'closed', 'failed', 'pending', 'stopped', 'degraded'];
+  const numbers = ['total', 'paused', 'queued', 'warningCount', 'nextAt', 'lastAttemptAt', 'lastContextAt'];
+  const codes = ['lastResult', 'lastDecision', 'learningSelection', 'lastError', 'lastContextReason'];
+  const allowedCodes = new Set(['waiting', 'existing-plans', 'applied', 'decision-failed', 'planner-failed', 'claimed',
+    'ready', 'complete', 'failed', 'uncertain', 'deciding', 'interrupted', 'scheduled', 'declined', 'duplicate', 'queue-full',
+    'closed', 'browser-disabled', 'browser-busy', 'life-busy', 'cancelled', 'completed', 'no-reading', 'reading-failed',
+    'no-new-facts', 'storage-unavailable', 'driver-failed', 'already-consumed', 'committed', 'stale', 'unavailable',
+    'contact-invalid-action', 'contact-window-missed', 'contact-source-failed', 'contact-no-candidate',
+    'contact-no-longer-current', 'contact-already-consumed', 'contact-claim-unavailable', 'contact-budget-blocked',
+    'contact-decision-failed', 'contact-declined', 'contact-send-uncertain', 'contact-not-sent', 'contact-sent-after-window',
+    'contact-sent', 'contact-driver-failed', 'prune-failed', 'initialize-failed', 'learning-failed', 'selection-unavailable',
+    'context-unavailable', 'source-unavailable', 'proactive-paused', 'current-boundary', 'no-relevant-learning',
+    'selected', 'stale-selection', 'reserved-until-delivery', 'invalid-output', 'invalid-evidence', 'model-timeout']);
+  for (const name of ['planner', 'browsing', 'proactive', 'learning', 'contacts']) {
+    const item = input[name]; if (!plain(item)) continue;
+    const safe = {};
+    for (const key of booleans) if (typeof item[key] === 'boolean') safe[key] = item[key];
+    for (const key of numbers) if (Number.isSafeInteger(item[key]) && item[key] >= 0) safe[key] = item[key];
+    // Some workers expose an aggregate count instead of a boolean.
+    if (Number.isSafeInteger(item.pending) && item.pending >= 0) safe.pending = item.pending;
+    for (const key of codes) if (allowedCodes.has(item[key])) safe[key] = item[key];
+    result[name] = safe;
+  }
+  return result;
+}
+
 /** Reads one already validated in-memory timeline snapshot. No disk, clock state,
  * recovery, scheduling or model access. Reports deliberately expose public life only. */
 export function buildLifeObserverReport(options = {}) {
@@ -155,6 +184,8 @@ export function buildLifeObserverReport(options = {}) {
       '兴趣强度单位为0—1；净变化 = 已发生事件实际增量 + 自然衰减。计划中的预期影响不计入。',
       '来源出现在规划输入、被念头引用和实际执行分别展示；关联不是已证实的单一因果。',
       '仅含公共个人生活，不包含任何对象的私聊记录；空白和没有变化都是正常结果。'] };
+  const operations = safeOperations(options.operations);
+  if (operations) report.operations = operations;
   if (!enabled) { report.completeness = { status: 'disabled', reason: 'life-disabled', warnings: [] }; return report; }
   if (diagnostics?.failed) { report.completeness.reason = 'timeline-recovery-required'; return report; }
   try {

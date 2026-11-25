@@ -1,7 +1,8 @@
+import { isPrivateScope, privateEventScope, privateScopeId } from './private-scope.js';
 // Conservative, explicit self reports only. This is not a personality classifier.
 export const PRIVATE_PROFILE_SOURCE = 'qq-profile';
 export const PRIVATE_PROFILE_TOPIC = 'private-profile-v1';
-export const isProfileScope = scope => typeof scope === 'string' && scope.length <= 160 && /^qq:private:[1-9]\d*$/.test(scope);
+export const isProfileScope = scope => typeof scope === 'string' && scope.length <= 160 && isPrivateScope(scope);
 const MAX_FACTS = 16, MAX_HISTORY = 8, MAX_SEEN = 256;
 const scalar = value => typeof value === 'string' && value.length > 0 && value.length <= 60
   && /^[\p{L}\p{N} ·_\-]+$/u.test(value);

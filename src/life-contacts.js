@@ -1,18 +1,22 @@
+import { isPrivateScope, privateEventScope, privateScopeId } from './private-scope.js';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { acquireFileLock } from './file-lock.js';
 
-const VERSION = 1, DAY = 86400000;
+const VERSION = 1, RESET_VERSION = 2, DAY = 86400000;
+export const CONTACT_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 const DEFAULTS = Object.freeze({ maxContacts: 512, maxReceipts: 65536, maxIntents: 4096,
   maxBytes: 16 * 1024 * 1024, maxIntentLifetimeMs: DAY });
 const states = new Set(['pending', 'generating', 'ready', 'sending', 'sent', 'failed', 'uncertain', 'cancelled']);
 const cancellable = new Set(['pending', 'generating', 'ready']);
+const deliveryStates = new Set(['received', 'sending', 'sent', 'uncertain']);
 const clone = value => structuredClone(value);
 const plain = value => value && typeof value === 'object' && !Array.isArray(value);
 const number = value => Number.isSafeInteger(value) && value >= 0;
 const time = value => number(value) && value <= 8640000000000000;
-const validScope = value => typeof value === 'string' && /^qq:private:[1-9]\d{0,127}$/.test(value);
+const validScope = value => isPrivateScope(value);
 const uuid = value => typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value);
 const digest = value => createHash('sha256').update(value).digest('hex');
 
@@ -23,7 +27,7 @@ function requiredText(value, label, max, multiline = false) {
 }
 
 function scopeOf(event) {
-  const scope = `qq:private:${String(event?.senderId ?? '')}`;
+  const scope = privateEventScope(event);
   if (event?.type !== 'private_message' || event.groupId != null || event.raw?.group_id != null || !validScope(scope)) {
     throw TypeError('Contact coordination requires a valid private participant');
   }
@@ -113,6 +117,72 @@ export function isExplicitContactStop(event) {
   return ownContactEvidence(event).some(line => {
     const clauses = line.split(/[，,。.!！;；]/u).map(part => part.trim()).filter(Boolean);
     return clauses.some((clause, index) => directStop(clause) && clauses.slice(0, index).every(currentReason));
+  });
+}
+
+// Keep only the actual, bounded imperative which made the existing stop rule
+// match. This is observer evidence, never a second consent classifier.
+function explicitStopEvidence(event) {
+  const original = ownText(event);
+  for (const line of ownContactEvidence(event)) {
+    const clauses = line.split(/[，,。.!！;；]/u).map(part => part.trim()).filter(Boolean);
+    const clause = clauses.find((part, index) => directStop(part) && clauses.slice(0, index).every(currentReason));
+    if (clause && clause.length <= 220 && original.includes(clause)) return clause;
+  }
+  return null;
+}
+
+function validatePauseDetail(value) {
+  if (!plain(value) || Object.keys(value).some(key => !['version', 'epoch', 'sequence', 'at', 'source', 'basis', 'reason', 'evidence', 'evidenceHash', 'evidenceRemoved'].includes(key))
+    || value.version !== 1 || !number(value.epoch) || !number(value.sequence) || value.sequence < 1 || !time(value.at)
+    || !['explicit-rule', 'contextual-model'].includes(value.source)
+    || value.basis !== (value.source === 'explicit-rule' ? 'explicit-stop' : 'contextual-impatience')
+    || (value.evidenceRemoved != null && (value.evidenceRemoved !== true || value.evidence !== null || value.evidenceHash !== null))
+    || (value.evidence === null ? value.evidenceHash !== null
+      : typeof value.evidence !== 'string' || !value.evidence.trim() || value.evidence.length > 220 || digest(value.evidence) !== value.evidenceHash)) {
+    throw Error('Invalid contact pause evidence');
+  }
+  requiredText(value.reason, 'contact pause reason', 500);
+}
+
+function latestPauseReceipt(contact) {
+  return [...contact.receipts].reverse().find(item => (item.stop && item.epoch === contact.epoch)
+    || (item.decision?.action === 'pause' && item.epoch + 1 === contact.epoch));
+}
+
+function pauseWindow(epoch, startedAt, origin) {
+  return { version: 1, epoch, startedAt, expiresAt: startedAt + CONTACT_COOLDOWN_MS, origin };
+}
+
+function validatePauseWindow(value) {
+  if (!plain(value) || Object.keys(value).some(key => !['version', 'epoch', 'startedAt', 'expiresAt', 'expiredAt', 'cancelledAt', 'cancelledBySequence', 'origin'].includes(key))
+    || value.version !== 1 || !number(value.epoch) || !time(value.startedAt) || !time(value.expiresAt)
+    || value.expiresAt - value.startedAt !== CONTACT_COOLDOWN_MS
+    || !['trigger', 'legacy-recovered', 'legacy-unknown'].includes(value.origin)
+    || (value.expiredAt != null && value.expiredAt !== value.expiresAt)
+    || ((value.cancelledAt != null || value.cancelledBySequence != null)
+      && (!time(value.cancelledAt) || !number(value.cancelledBySequence) || value.cancelledBySequence < 1))) throw Error('Invalid contact cooldown window');
+}
+
+function activePause(contact, at) {
+  if (!contact?.paused) return false;
+  const window = contact.pauseWindow;
+  return !window || window.epoch !== contact.epoch || (window.expiredAt == null && window.cancelledAt == null && at < window.expiresAt);
+}
+
+function pausedContactDetails(state, at) {
+  return state.contacts.filter(contact => activePause(contact, at)).map(contact => {
+    const detail = contact.pauseDetail?.epoch === contact.epoch ? contact.pauseDetail : null;
+    const receipt = detail ? null : latestPauseReceipt(contact);
+    const source = detail?.source || (receipt?.stop ? 'explicit-rule' : receipt?.decision ? 'contextual-model' : 'legacy-unknown');
+    const pausedAt = detail?.at ?? receipt?.decision?.at ?? receipt?.at ?? null;
+    const evidence = detail?.evidence ?? null;
+    return { scope: contact.scope, userId: privateScopeId(contact.scope), pausedAt,
+      expiresAt: contact.pauseWindow.expiresAt, source,
+      basis: detail?.basis || (receipt?.stop ? 'explicit-stop' : receipt?.decision?.basis ?? null),
+      reason: detail?.reason || (receipt?.stop ? 'explicit-stop' : receipt?.decision?.reason ?? null), evidence,
+      evidenceStatus: evidence !== null ? 'recorded' : detail?.evidenceRemoved ? 'removed-by-memory-reset'
+        : state.memoryReset && pausedAt !== null && pausedAt <= state.memoryReset.at ? 'removed-by-memory-reset' : 'legacy-unavailable' };
   });
 }
 
@@ -230,20 +300,46 @@ async function atomicWrite(path, value, { missing = false, maxBytes = Infinity }
 }
 
 function validate(state, policy) {
-  if (!plain(state) || state.version !== VERSION || !uuid(state.storeId) || !Array.isArray(state.contacts)
+  if (!plain(state) || ![VERSION, RESET_VERSION].includes(state.version) || !uuid(state.storeId) || !Array.isArray(state.contacts)
     || !Array.isArray(state.intents) || state.contacts.length > policy.maxContacts || state.intents.length > policy.maxIntents) throw Error('Invalid contact state; original file preserved');
+  if (state.version === RESET_VERSION && (!plain(state.memoryReset)
+    || Object.keys(state.memoryReset).some(key => !['operationId', 'at'].includes(key))
+    || !uuid(state.memoryReset.operationId) || !time(state.memoryReset.at))) throw Error('Missing contact memory reset boundary');
+  if (state.version === VERSION && state.memoryReset != null) throw Error('Contact reset boundary requires version 2');
   const scopes = new Set(); let receipts = 0;
   for (const contact of state.contacts) {
     if (!plain(contact) || !validScope(contact.scope) || scopes.has(contact.scope) || !number(contact.epoch)
       || !number(contact.sequence) || contact.sequence < 1 || typeof contact.paused !== 'boolean'
       || !time(contact.lastIncomingAt) || !Array.isArray(contact.receipts)) throw Error('Invalid contact participant');
     scopes.add(contact.scope);
-    const keys = new Set(); let expectedEpoch = 0, expectedPaused = false;
+    // Optional top-level metadata is readable by the previous release. A
+    // previous writer may leave it stale; only the matching pause epoch is
+    // displayed, never attached to a later pause by inference.
+    if (contact.pauseDetail != null) validatePauseDetail(contact.pauseDetail);
+    if (contact.pauseWindow != null) validatePauseWindow(contact.pauseWindow);
+    if (contact.maintenanceGuard != null && (!plain(contact.maintenanceGuard)
+      || !time(contact.maintenanceGuard.lastConsideredAt) || !number(contact.maintenanceGuard.unansweredThroughSequence)
+      || contact.maintenanceGuard.unansweredThroughSequence > contact.sequence)) throw Error('Invalid contact maintenance guard');
+    if (contact.resetGuard != null && (state.version !== RESET_VERSION || !plain(contact.resetGuard)
+      || Object.keys(contact.resetGuard).some(key => !['lastConsideredAt', 'unansweredThroughSequence'].includes(key))
+      || (contact.resetGuard.lastConsideredAt !== null && !time(contact.resetGuard.lastConsideredAt))
+      || !number(contact.resetGuard.unansweredThroughSequence)
+      || contact.resetGuard.unansweredThroughSequence > contact.sequence)) throw Error('Invalid contact reset guard');
+    const checkpoint = contact.checkpoint || { sequence: 0, epoch: 0, paused: false };
+    if (!number(checkpoint.sequence) || checkpoint.sequence >= contact.sequence || !number(checkpoint.epoch)
+      || checkpoint.epoch > contact.epoch || typeof checkpoint.paused !== 'boolean') throw Error('Invalid contact checkpoint');
+    const keys = new Set(); let expectedEpoch = checkpoint.epoch, expectedPaused = checkpoint.paused;
     for (const receipt of contact.receipts) {
       if (!plain(receipt) || typeof receipt.key !== 'string' || !receipt.key || receipt.key.length > 240 || keys.has(receipt.key)
         || !number(receipt.epoch) || receipt.epoch > contact.epoch || !number(receipt.sequence) || receipt.sequence < 1
-        || receipt.sequence !== keys.size + 1 || typeof receipt.stop !== 'boolean'
+        || receipt.sequence !== checkpoint.sequence + keys.size + 1 || typeof receipt.stop !== 'boolean'
         || !time(receipt.at) || !/^[a-f0-9]{64}$/.test(receipt.fingerprint)) throw Error('Invalid contact receipt');
+      if (receipt.delivery != null && (!plain(receipt.delivery) || !deliveryStates.has(receipt.delivery.state)
+        || !time(receipt.delivery.at) || (receipt.delivery.sentMessageIds != null && (!Array.isArray(receipt.delivery.sentMessageIds)
+          || receipt.delivery.sentMessageIds.length > 8 || receipt.delivery.sentMessageIds.some(id => typeof id !== 'string' || !id || id.length > 120))))) throw Error('Invalid incoming delivery state');
+      if (receipt.delivery?.epochToken != null && (receipt.delivery.epochToken.scope !== contact.scope
+        || typeof receipt.delivery.epochToken.epoch !== 'string' || !receipt.delivery.epochToken.epoch
+        || receipt.delivery.epochToken.epoch.length > 300)) throw Error('Invalid incoming memory epoch');
       keys.add(receipt.key);
       if (receipt.stop) { expectedEpoch++; expectedPaused = true; }
       if (receipt.epoch !== expectedEpoch) throw Error('Inconsistent contact history');
@@ -259,7 +355,7 @@ function validate(state, policy) {
         else { if (!expectedPaused) throw Error('Inconsistent contact resume history'); expectedPaused = false; }
       }
     }
-    if (contact.receipts.length !== contact.sequence || expectedEpoch !== contact.epoch || contact.paused !== expectedPaused) throw Error('Inconsistent contact history');
+    if (contact.receipts.length + checkpoint.sequence !== contact.sequence || expectedEpoch !== contact.epoch || contact.paused !== expectedPaused) throw Error('Inconsistent contact history');
     receipts += contact.receipts.length;
   }
   if (receipts > policy.maxReceipts) throw Error('Contact receipt capacity exceeded');
@@ -286,14 +382,44 @@ function validate(state, policy) {
   return state;
 }
 
+/** Pure offline transformation. It preserves only delivery/consent metadata;
+ * it never fabricates an incoming message or an invitation. Version 2 makes
+ * pre-reset code fail closed rather than silently discard the outbound fence.
+ */
+export function resetLifeContactMemory(input, { operationId, at } = {}) {
+  validate(input, DEFAULTS);
+  if (!uuid(operationId) || !time(at)) throw TypeError('A real memory reset operation boundary is required');
+  const contacts = input.contacts.map(contact => {
+    const prior = input.intents.filter(intent => intent.scope === contact.scope);
+    const times = prior.map(intent => intent.createdAt);
+    if (contact.resetGuard?.lastConsideredAt != null) times.push(contact.resetGuard.lastConsideredAt);
+    if (contact.maintenanceGuard?.lastConsideredAt != null) times.push(contact.maintenanceGuard.lastConsideredAt);
+    const unanswered = prior.some(intent => ['sent', 'sending', 'uncertain'].includes(intent.status)
+      && (intent.sequence != null ? intent.sequence >= contact.sequence : (intent.doneAt ?? intent.createdAt) >= contact.lastIncomingAt));
+    const receipts = contact.receipts.map(receipt => ({ key: receipt.key, fingerprint: receipt.fingerprint,
+      epoch: receipt.epoch, sequence: receipt.sequence, stop: receipt.stop, at: receipt.at,
+      ...(receipt.delivery ? { delivery: clone(receipt.delivery) } : {}),
+      ...(receipt.decision ? { decision: { action: receipt.decision.action, basis: receipt.decision.basis,
+        evidenceHash: receipt.decision.evidenceHash, reason: 'removed-by-memory-reset', at: receipt.decision.at } } : {}) }));
+    return { scope: contact.scope, epoch: contact.epoch, sequence: contact.sequence,
+      paused: contact.paused, lastIncomingAt: contact.lastIncomingAt, receipts,
+      ...(contact.pauseWindow ? { pauseWindow: clone(contact.pauseWindow) } : {}),
+      ...(contact.checkpoint ? { checkpoint: clone(contact.checkpoint) } : {}),
+      resetGuard: { lastConsideredAt: times.length ? Math.max(...times) : null,
+        unansweredThroughSequence: unanswered ? contact.sequence : Math.max(contact.resetGuard?.unansweredThroughSequence || 0,
+          contact.maintenanceGuard?.unansweredThroughSequence || 0) } };
+  });
+  return validate({ version: RESET_VERSION, storeId: randomUUID(), memoryReset: { operationId, at }, contacts, intents: [] }, DEFAULTS);
+}
+
 /**
  * Same-object stop epochs and at-most-one-attempt proactive claims. The caller
- * holds life-timeline's writer lock for this directory. No timer, model, memory
+ * holds its own process writer lock for this directory. No timer, model, memory
  * lookup, recipient selection or transport is owned here. Never expose a token
  * supplied by an HTTP callback as a trusted receipt from observeIncoming.
  */
 export async function createLifeContacts({ directory, timeline, now = Date.now, policy: supplied = {} } = {}) {
-  if (!directory || !timeline?.snapshot || !timeline?.availability) throw Error('Contact coordination needs its owning life timeline');
+  if (!directory) throw Error('Contact coordination needs its own state directory');
   const policy = { ...DEFAULTS };
   for (const key of Object.keys(supplied)) {
     if (!(key in policy) || !Number.isSafeInteger(supplied[key]) || supplied[key] < 1 || supplied[key] > policy[key]) throw TypeError('Invalid contact policy');
@@ -302,6 +428,8 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
   const root = resolve(directory); await mkdir(root, { recursive: true });
   const rootInfo = await lstat(root);
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw Error('Contact directory must be a real directory');
+  const releaseWriter = await acquireFileLock(join(root, '.contacts-writer.lock'), { label: 'contact writer' });
+  try {
   const file = join(root, 'contacts.json'), marker = join(root, '.contacts-initialized');
   const info = await regular(file, true, policy.maxBytes), markerInfo = await regular(marker, true, 1024);
   let state;
@@ -313,28 +441,117 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
     if (!info || !markerInfo) throw Error('Initialized contact state is missing; preserve files for recovery');
     const receipt = await readJson(marker, 1024);
     state = validate(await readJson(file, policy.maxBytes), policy);
-    if (receipt?.version !== VERSION || receipt.storeId !== state.storeId) throw Error('Contact initialization marker does not match');
+    if (receipt?.version !== state.version || receipt.storeId !== state.storeId) throw Error('Contact initialization marker does not match');
   }
   let fault = null, closed = false, closingTask, tail = Promise.resolve();
-  const operations = new Set(), pendingStops = new Map(), pendingIncoming = new Map();
+  const operations = new Set(), pendingStops = new Map(), pendingIncoming = new Map(), pendingEvidenceRemovals = new Map();
   const stamp = () => { const value = now(); if (!time(value)) throw Error('Invalid contact clock'); return value; };
+  let lastPauseClock = stamp();
+  const pauseClock = () => (lastPauseClock = Math.max(lastPauseClock, stamp()));
   const participant = (scope, source = state) => source.contacts.find(contact => contact.scope === scope);
+  const receiptFor = (contact, sequence) => contact?.receipts[sequence - (contact.checkpoint?.sequence || 0) - 1];
+  // 256 hash shards keep long-lived tombstones compact on disk; one file per
+  // message would turn a small ledger into hundreds of megabytes of blocks.
+  const archivePath = (kind, key) => join(root, 'contact-archive', kind, digest(key).slice(0, 2) + '.json');
+  async function archiveShard(kind, key) {
+    try {
+      const shard = await readJson(archivePath(kind, key), Infinity);
+      if (!plain(shard) || Object.keys(shard).some(id => !/^[a-f0-9]{64}$/.test(id))) throw Error('Invalid contact archive shard');
+      return shard;
+    }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }
+  async function archived(kind, key) { return (await archiveShard(kind, key))?.[digest(key)] || null; }
+  async function archive(kind, key, value) {
+    const path = archivePath(kind, key), shard = await archiveShard(kind, key) || {}, old = shard[digest(key)];
+    if (old) {
+      if (JSON.stringify(old) !== JSON.stringify(value)) throw Error('Conflicting contact maintenance archive');
+      return;
+    }
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    shard[digest(key)] = value;
+    await atomicWrite(path, shard, { missing: true });
+  }
+  // Hot state is bounded; durable delivery/consent tombstones remain in separate
+  // small immutable files. Archive first, then move the checkpoint atomically.
+  // A crash between those writes only leaves a harmless duplicate tombstone.
+  async function maintain(next, { receipts = 0, intents = 0, replacingScope } = {}) {
+    // Unsent inputs have the same bounded retry window as deferred replies.
+    // Keep an explicit tombstone after that window, never fabricate delivery.
+    for (const contact of next.contacts) for (const receipt of contact.receipts) if (receipt.delivery?.state === 'received') {
+      if (receipt.epoch !== contact.epoch) receipt.delivery = { state: 'uncertain', at: stamp(), reason: 'contact-stopped' };
+      else if (stamp() - receipt.at >= 2 * DAY) receipt.delivery = { state: 'uncertain', at: stamp(), reason: 'expired-without-delivery' };
+    }
+    const pressure = () => Buffer.byteLength(JSON.stringify(next)) > policy.maxBytes * 0.85;
+    const count = () => next.contacts.reduce((sum, contact) => sum + contact.receipts.length, 0);
+    while (count() + receipts > policy.maxReceipts || pressure()) {
+      const contact = next.contacts.filter(item => (item.receipts.length > 1 || item.scope === replacingScope && item.receipts.length > 0)
+        && !['received', 'sending'].includes(item.receipts[0].delivery?.state))
+        .sort((a, b) => a.receipts[0].at - b.receipts[0].at)[0];
+      if (!contact) break;
+      const receipt = contact.receipts[0];
+      const tombstone = clone(receipt);
+      if (tombstone.decision) tombstone.decision.reason = 'removed-by-maintenance';
+      await archive('receipts', `${contact.scope}\0${receipt.key}`, { scope: contact.scope, receipt: tombstone });
+      const paused = receipt.decision ? receipt.decision.action === 'pause'
+        : receipt.stop ? true : (contact.checkpoint?.paused || false);
+      contact.checkpoint = { sequence: receipt.sequence, epoch: receipt.epoch + (receipt.decision?.action === 'pause' ? 1 : 0), paused };
+      contact.receipts.shift();
+    }
+    while (next.intents.length + intents > policy.maxIntents || pressure()) {
+      const index = next.intents.findIndex(item => ['sent', 'failed', 'uncertain', 'cancelled'].includes(item.status));
+      if (index < 0) break;
+      const item = next.intents[index], contact = participant(item.scope, next);
+      const payload = { id: item.id, scope: item.scope, epoch: item.epoch, ...(item.sequence != null ? { sequence: item.sequence } : {}),
+        sources: item.sources, reason: item.reason, notBefore: item.notBefore, expiresAt: item.expiresAt };
+      await archive('intents', item.id, { id: item.id, payloadHash: digest(JSON.stringify(payload)), status: item.status });
+      // Preserve selection cooldown/unanswered fences even after hot history is archived.
+      contact.maintenanceGuard ||= { lastConsideredAt: 0, unansweredThroughSequence: 0 };
+      contact.maintenanceGuard.lastConsideredAt = Math.max(contact.maintenanceGuard.lastConsideredAt, item.createdAt);
+      if (['sent', 'uncertain'].includes(item.status)) contact.maintenanceGuard.unansweredThroughSequence = Math.max(
+        contact.maintenanceGuard.unansweredThroughSequence, item.sequence ?? contact.sequence);
+      next.intents.splice(index, 1);
+    }
+  }
   const findIntent = (id, source = state) => source.intents.find(intent => intent.id === id);
   const markCancelled = (intent, reason, at) => { intent.status = 'cancelled'; intent.doneAt = at; intent.outcome = reason; delete intent.replyText; };
 
   async function persist(next) {
+    releaseWriter.assertHeld();
+    const at = pauseClock();
+    for (const contact of next.contacts) if (contact.paused && contact.pauseWindow?.epoch === contact.epoch
+      && contact.pauseWindow.expiredAt == null && contact.pauseWindow.cancelledAt == null
+      && at >= contact.pauseWindow.expiresAt) contact.pauseWindow.expiredAt = contact.pauseWindow.expiresAt;
+    validate(next, policy);
+    if (Buffer.byteLength(JSON.stringify(next) + '\n') > policy.maxBytes) throw Error('Contact state capacity exceeded; existing participants remain available');
     try {
-      validate(next, policy);
       await regular(marker, false, 1024);
       await atomicWrite(file, next, { maxBytes: policy.maxBytes });
       state = next;
     } catch (error) { fault = error; throw error; }
   }
   const recovered = clone(state); let recoveryChanged = false;
+  // Old permanent latches retain their receipt history for rollback readers,
+  // but runtime suppression is now a fixed two-hour window. Never date a known
+  // old pause from this startup; only an unknowable legacy trigger starts once.
+  for (const contact of recovered.contacts) if (contact.paused) {
+    if (contact.pauseWindow?.epoch !== contact.epoch) {
+      const receipt = latestPauseReceipt(contact), detail = contact.pauseDetail?.epoch === contact.epoch ? contact.pauseDetail : null;
+      const knownAt = detail?.at ?? receipt?.decision?.at ?? receipt?.at;
+      contact.pauseWindow = pauseWindow(contact.epoch, knownAt ?? stamp(), knownAt == null ? 'legacy-unknown' : 'legacy-recovered');
+      recoveryChanged = true;
+    }
+    if (contact.pauseWindow.expiredAt == null && contact.pauseWindow.cancelledAt == null && pauseClock() >= contact.pauseWindow.expiresAt) {
+      contact.pauseWindow.expiredAt = contact.pauseWindow.expiresAt; recoveryChanged = true;
+    }
+  }
+  for (const contact of recovered.contacts) for (const receipt of contact.receipts) if (receipt.delivery?.state === 'sending') {
+    receipt.delivery = { ...receipt.delivery, state: 'uncertain', at: stamp(), reason: 'process-interrupted' }; recoveryChanged = true;
+  }
   for (const intent of recovered.intents) {
     if (['generating', 'sending'].includes(intent.status)) {
       intent.status = 'uncertain'; intent.outcome = 'process-interrupted'; intent.doneAt = stamp(); delete intent.replyText; recoveryChanged = true;
-    } else if (cancellable.has(intent.status) && (participant(intent.scope).paused || intent.epoch !== participant(intent.scope).epoch
+    } else if (cancellable.has(intent.status) && (activePause(participant(intent.scope, recovered), pauseClock()) || intent.epoch !== participant(intent.scope).epoch
       || (intent.sequence != null && intent.sequence !== participant(intent.scope).sequence) || intent.expiresAt <= stamp())) {
       markCancelled(intent, 'stopped-stale-or-expired', stamp()); recoveryChanged = true;
     }
@@ -347,7 +564,7 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
     task.then(() => operations.delete(task), () => operations.delete(task)); return task;
   }
   function serial(callback) {
-    const task = tail.then(() => { if (fault) throw Error('Contact coordination needs recovery after a persistence failure'); return callback(); });
+    const task = tail.then(() => { releaseWriter.assertHeld(); if (fault) throw Error('Contact coordination needs recovery after a persistence failure'); return callback(); });
     tail = task.catch(() => {}); return task;
   }
   function tokenFor(contact, receipt, duplicate = false) {
@@ -357,14 +574,19 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
     if (fault || closed || !plain(token) || !validScope(token.scope) || !number(token.epoch)
       || !number(token.sequence) || token.sequence < 1 || token.stop !== false || pendingStops.has(token.scope)) return false;
     const contact = participant(token.scope);
-    const receipt = contact?.receipts[token.sequence - 1];
+    const receipt = receiptFor(contact, token.sequence);
+    if (token.proactiveAfterCooldown === true) {
+      return Boolean(proactive && contact && contact.epoch === token.epoch && contact.sequence === token.sequence
+        && receipt && receipt.epoch === token.receiptEpoch && !activePause(contact, pauseClock())
+        && !pendingIncoming.has(token.scope));
+    }
     return Boolean(contact && contact.epoch === token.epoch && receipt && receipt.epoch === token.epoch && !receipt.stop
-      && (!proactive || (!contact.paused && !pendingIncoming.has(token.scope)))
+      && (!proactive || (!activePause(contact, pauseClock()) && !pendingIncoming.has(token.scope)))
       && (!latest || (!pendingIncoming.has(token.scope) && contact.sequence === token.sequence)));
   }
   function activeIntent(intent) {
     const contact = intent && participant(intent.scope);
-    return Boolean(!fault && !closed && contact && !contact.paused && intent.epoch === contact.epoch
+    return Boolean(!fault && !closed && contact && !activePause(contact, pauseClock()) && intent.epoch === contact.epoch
       && (intent.sequence == null || intent.sequence === contact.sequence)
       && (intent.sequence == null || !pendingIncoming.has(intent.scope))
       && !pendingStops.has(intent.scope) && intent.expiresAt > stamp());
@@ -377,41 +599,178 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
 
   const api = {
     file, marker, policy: Object.freeze(policy),
+    diagnostics() { return { failed: Boolean(fault), closed }; },
     isCurrent: current,
+    incomingState(token) {
+      const receipt = receiptFor(participant(token?.scope), token?.sequence);
+      return receipt && receipt.epoch === token?.epoch ? receipt.delivery?.state || 'uncertain' : 'uncertain';
+    },
+    incomingMessageId(token) {
+      const receipt = receiptFor(participant(token?.scope), token?.sequence);
+      return receipt?.epoch === token?.epoch && receipt.key.startsWith('message:') ? receipt.key.slice(8) : null;
+    },
+    incomingEpoch(token) {
+      const receipt = receiptFor(participant(token?.scope), token?.sequence);
+      return receipt?.epoch === token?.epoch && receipt.delivery?.epochToken ? clone(receipt.delivery.epochToken) : null;
+    },
+    cancelIncoming(tokens, reason = 'memory-epoch-changed') {
+      return work(() => serial(async () => {
+        const next = clone(state); let changed = false;
+        for (const token of tokens || []) {
+          const receipt = receiptFor(participant(token?.scope, next), token?.sequence);
+          if (receipt?.epoch !== token?.epoch || receipt.delivery?.state !== 'received') continue;
+          receipt.delivery = { ...receipt.delivery, state: 'uncertain', at: stamp(), reason: String(reason).slice(0, 120) }; changed = true;
+        }
+        if (changed) await persist(next); return { ok: true, changed };
+      }));
+    },
+    canReplyIncoming(tokens) { return Array.isArray(tokens) && tokens.length > 0
+      && tokens.every(token => current(token) && api.incomingState(token) === 'received'); },
+    beginIncoming(tokens) {
+      return work(() => serial(async () => {
+        if (!api.canReplyIncoming(tokens)) return { ok: false, reason: 'incoming-already-consumed-or-stale' };
+        const next = clone(state), at = stamp();
+        for (const token of tokens) {
+          const receipt = receiptFor(participant(token.scope, next), token.sequence);
+          receipt.delivery = { ...receipt.delivery, state: 'sending', at };
+        }
+        await persist(next); return { ok: true };
+      }));
+    },
+    finishIncoming(tokens, { ok = false, uncertain = false, sentMessageIds = [], reason } = {}) {
+      return work(() => serial(async () => {
+        if (!Array.isArray(tokens) || !tokens.length || !Array.isArray(sentMessageIds)
+          || sentMessageIds.length > 8 || sentMessageIds.some(id => typeof id !== 'string' || !id || id.length > 120)) throw TypeError('Invalid incoming outcome');
+        const next = clone(state), at = stamp(); let changed = false;
+        const outcome = ok || sentMessageIds.length ? 'sent' : uncertain ? 'uncertain' : 'received';
+        for (const token of tokens) {
+          const receipt = receiptFor(participant(token.scope, next), token.sequence);
+          if (!receipt || receipt.epoch !== token.epoch || receipt.delivery?.state !== 'sending') continue;
+          receipt.delivery = { ...receipt.delivery, state: outcome, at, ...(sentMessageIds.length ? { sentMessageIds: [...new Set(sentMessageIds)] } : {}),
+            ...(typeof reason === 'string' ? { reason: reason.slice(0, 120) } : {}) }; changed = true;
+        }
+        if (changed) await persist(next);
+        return { ok: true, state: outcome, changed };
+      }));
+    },
+    reconcilePwaIncoming(tokens, { sentMessageIds } = {}) {
+      return work(() => serial(async () => {
+        if (!Array.isArray(tokens) || !tokens.length || !Array.isArray(sentMessageIds) || !sentMessageIds.length
+          || sentMessageIds.length > 8 || sentMessageIds.some(id => typeof id !== 'string' || !id || id.length > 120)) throw Error('Invalid PWA delivery proof');
+        const next = clone(state); let changed = false;
+        for (const token of tokens) {
+          const receipt = receiptFor(participant(token.scope, next), token.sequence);
+          if (!receipt || receipt.epoch !== token.epoch) continue;
+          if (receipt.delivery?.state === 'sent') continue;
+          receipt.delivery = { ...receipt.delivery, state: 'sent', at: stamp(), sentMessageIds: [...new Set(sentMessageIds)], reason: 'pwa-mailbox-confirmed' };
+          changed = true;
+        }
+        if (changed) await persist(next);
+        return { ok: true, changed };
+      }));
+    },
+    recoverPwaIncoming(tokens) {
+      return work(() => serial(async () => {
+        if (!Array.isArray(tokens) || !tokens.length) throw Error('Invalid PWA intake proof');
+        const next = clone(state); let changed = false;
+        for (const token of tokens) {
+          if (!current(token)) continue;
+          const receipt = receiptFor(participant(token.scope, next), token.sequence);
+          if (!receipt || !['sending', 'uncertain'].includes(receipt.delivery?.state)) continue;
+          if (receipt.delivery?.sentMessageIds?.length) continue;
+          receipt.delivery = { ...receipt.delivery, state: 'received', at: stamp(), reason: 'pwa-mailbox-absent' };
+          changed = true;
+        }
+        if (changed) await persist(next);
+        return { ok: true, changed };
+      }));
+    },
+    reconcilePwaIntent(id) {
+      return work(() => serial(async () => {
+        const next = clone(state), intent = findIntent(id, next);
+        if (!intent || intent.status === 'sent') return { ok: true, changed: false };
+        if (!['sending', 'uncertain'].includes(intent.status)) return { ok: false, reason: 'intent-not-dispatched' };
+        intent.status = 'sent'; intent.doneAt = stamp(); intent.outcome = 'pwa-mailbox-confirmed'; delete intent.replyText;
+        await persist(next); return { ok: true, changed: true };
+      }));
+    },
+    isPaused(scope) { return activePause(participant(scope), pauseClock()); },
     capture(scope) {
       const contact = participant(scope);
       if (!contact) return null;
       return tokenFor(contact, contact.receipts.at(-1));
     },
+    captureProactive(scope) {
+      const contact = participant(scope), receipt = contact?.receipts.at(-1);
+      if (!contact || !receipt || activePause(contact, pauseClock())) return null;
+      if (!receipt.stop && receipt.epoch === contact.epoch) return tokenFor(contact, receipt);
+      // A cooldown can expire without a new incoming message. This token is
+      // exclusively for a fresh proactive decision, never an ordinary replay.
+      return { scope, epoch: contact.epoch, sequence: contact.sequence, stop: false,
+        proactiveAfterCooldown: true, receiptEpoch: receipt.epoch };
+    },
+    tickPauseWindows() {
+      return work(() => serial(async () => {
+        const at = pauseClock();
+        if (!state.contacts.some(contact => contact.paused && contact.pauseWindow?.epoch === contact.epoch
+          && contact.pauseWindow.expiredAt == null && contact.pauseWindow.cancelledAt == null && at >= contact.pauseWindow.expiresAt)) return { changed: false };
+        await persist(clone(state)); return { changed: true };
+      }));
+    },
     snapshot(scope) {
       if (scope != null && !validScope(scope)) throw TypeError('Invalid contact scope');
-      return clone(scope == null ? state : { version: VERSION, contacts: state.contacts.filter(contact => contact.scope === scope),
+      return clone(scope == null ? state : { version: state.version, contacts: state.contacts.filter(contact => contact.scope === scope),
         intents: state.intents.filter(intent => intent.scope === scope) });
     },
+    pausedDetails() {
+      if (fault || closed) throw Error('Contact pause state is unavailable');
+      return pausedContactDetails(state, Math.max(lastPauseClock, stamp())).map(detail => pendingEvidenceRemovals.has('all') || pendingEvidenceRemovals.has(detail.scope)
+        ? { ...detail, evidence: null, reason: 'removed-by-memory-reset', evidenceStatus: 'removed-by-memory-reset' } : detail);
+    },
+    forgetPauseEvidence(scope) {
+      if (scope !== 'all' && !validScope(scope)) return Promise.reject(TypeError('Invalid pause evidence scope'));
+      // Memory invalidation hides the evidence immediately, before the sidecar
+      // fsync. It does not resume contact or alter any delivery/consent fence.
+      pendingEvidenceRemovals.set(scope, (pendingEvidenceRemovals.get(scope) || 0) + 1);
+      return work(() => serial(async () => {
+        const next = clone(state); let changed = 0;
+        for (const contact of next.contacts) {
+          if ((scope !== 'all' && contact.scope !== scope) || !contact.pauseDetail || contact.pauseDetail.evidenceRemoved) continue;
+          contact.pauseDetail = { ...contact.pauseDetail, evidence: null, evidenceHash: null,
+            reason: 'removed-by-memory-reset', evidenceRemoved: true }; changed++;
+        }
+        if (changed) await persist(next);
+        return { changed };
+      })).finally(() => {
+        const remaining = (pendingEvidenceRemovals.get(scope) || 1) - 1;
+        if (remaining) pendingEvidenceRemovals.set(scope, remaining); else pendingEvidenceRemovals.delete(scope);
+      });
+    },
     applyDecision({ token, event, decision } = {}) {
-      let scope, payload, fingerprint, key;
+      let scope, payload, fingerprint, key, pauseEvidence;
       try {
         scope = scopeOf(event); payload = normalizedDecision(decision, event); fingerprint = digest(ownText(event));
+        pauseEvidence = decision.evidence.trim();
         key = event.raw?.message_id == null ? null : `message:${requiredText(String(event.raw.message_id), 'contact message id', 200)}`;
         if (!plain(token) || token.scope !== scope || !number(token.epoch) || !number(token.sequence)
           || token.sequence < 1 || token.stop !== false) throw TypeError('Invalid contact decision token');
-        const receipt = participant(scope)?.receipts[token.sequence - 1];
+        const receipt = receiptFor(participant(scope), token.sequence);
         if (!receipt || receipt.epoch !== token.epoch || receipt.stop || receipt.fingerprint !== fingerprint
           || (key == null ? !receipt.key.startsWith('local:') : receipt.key !== key)) {
           throw TypeError('Contact decision does not match its incoming receipt');
         }
       } catch (error) { return Promise.reject(error); }
-      const known = participant(scope)?.receipts[token.sequence - 1];
+      const known = receiptFor(participant(scope), token.sequence);
       const fence = payload.action === 'pause' && !known?.decision
         && !pendingIncoming.has(scope) && participant(scope)?.sequence === token.sequence && participant(scope)?.epoch === token.epoch ? randomUUID() : null;
       if (fence) {
         const pending = pendingStops.get(scope) || new Set(); pending.add(fence); pendingStops.set(scope, pending);
       }
       return work(() => serial(async () => {
-        const next = clone(state), contact = participant(scope, next), receipt = contact?.receipts[token.sequence - 1];
+        const next = clone(state), contact = participant(scope, next), receipt = receiptFor(contact, token.sequence);
         if (receipt?.decision) {
           if (Object.keys(payload).some(key => payload[key] !== receipt.decision[key])) throw Error('Contact receipt has a different boundary decision');
-          return { applied: false, duplicate: true, action: payload.action, epoch: contact.epoch, paused: contact.paused };
+          return { applied: false, duplicate: true, action: payload.action, epoch: contact.epoch, paused: activePause(contact, pauseClock()) };
         }
         if (!contact || contact.sequence !== token.sequence || contact.epoch !== token.epoch || pendingIncoming.has(scope)
           || (payload.action === 'resume' && pendingStops.has(scope))) return { applied: false, reason: 'contact-decision-stale' };
@@ -419,21 +778,28 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
         const at = stamp(); receipt.decision = { ...payload, at };
         if (payload.action === 'pause') {
           contact.epoch++; contact.paused = true;
+          contact.pauseWindow = pauseWindow(contact.epoch, pauseClock(), 'trigger');
+          contact.pauseDetail = { version: 1, epoch: contact.epoch, sequence: token.sequence, at,
+            source: 'contextual-model', basis: payload.basis, reason: payload.reason,
+            evidence: pauseEvidence, evidenceHash: payload.evidenceHash };
           for (const intent of next.intents) if (intent.scope === scope && cancellable.has(intent.status)) markCancelled(intent, 'contextual-impatience', at);
-        } else contact.paused = false;
+        } else { contact.paused = false; delete contact.pauseDetail; delete contact.pauseWindow; }
         await persist(next);
-        return { applied: true, action: payload.action, epoch: contact.epoch, paused: contact.paused };
+        return { applied: true, action: payload.action, epoch: contact.epoch, paused: activePause(contact, pauseClock()) };
       })).finally(() => {
         if (fence) { const pending = pendingStops.get(scope); pending?.delete(fence); if (!pending?.size) pendingStops.delete(scope); }
       });
     },
-    observeIncoming(event) {
-      let scope, key, fingerprint, stop;
+    observeIncoming(event, { epochToken } = {}) {
+      let scope, key, fingerprint, stop, stopEvidence;
       try {
         scope = scopeOf(event);
         const messageId = event.raw?.message_id;
         key = messageId == null ? `local:${randomUUID()}` : `message:${requiredText(String(messageId), 'contact message id', 200)}`;
         fingerprint = digest(ownText(event)); stop = isExplicitContactStop(event);
+        stopEvidence = stop ? explicitStopEvidence(event) : null;
+        if (epochToken != null && (epochToken.scope !== scope || typeof epochToken.epoch !== 'string'
+          || !epochToken.epoch || epochToken.epoch.length > 300)) throw TypeError('Invalid incoming memory epoch');
       } catch (error) { return Promise.reject(error); }
       // Establish the fence synchronously, before an async fsync can yield to a
       // previously claimed send. Duplicate stop receipts do not create a fence.
@@ -453,22 +819,40 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
         const old = contact?.receipts.find(receipt => receipt.key === key);
         if (old) {
           if (old.fingerprint !== fingerprint) throw Error('Contact message id has different content');
+          if (old.delivery?.state === 'received' && !old.delivery.epochToken && epochToken) {
+            old.delivery.epochToken = clone(epochToken); await persist(next);
+          }
           return tokenFor(contact, old, true);
         }
+        const history = await archived('receipts', `${scope}\0${key}`);
+        if (history) {
+          if (history.scope !== scope || history.receipt?.key !== key || history.receipt.fingerprint !== fingerprint) throw Error('Contact message id has different archived content');
+          return tokenFor(contact, history.receipt, true);
+        }
         if (!contact) {
-          if (next.contacts.length >= policy.maxContacts) { fault = Error('Contact participant capacity exceeded'); throw fault; }
+          if (next.contacts.length >= policy.maxContacts) throw Error('Contact participant capacity exceeded');
           contact = { scope, epoch: 0, sequence: 0, paused: false, lastIncomingAt: stamp(), receipts: [] }; next.contacts.push(contact);
         }
-        if (next.contacts.reduce((sum, entry) => sum + entry.receipts.length, 0) >= policy.maxReceipts) {
-          fault = Error('Contact receipt capacity exceeded; preserve history for maintenance'); throw fault;
-        }
+        await maintain(next, { receipts: 1, replacingScope: scope });
+        if (next.contacts.reduce((sum, entry) => sum + entry.receipts.length, 0) >= policy.maxReceipts) throw Error('Contact receipt capacity exceeded; outstanding deliveries retained');
         const at = stamp();
         if (stop) {
           contact.epoch++; contact.paused = true;
+          contact.pauseWindow = pauseWindow(contact.epoch, pauseClock(), 'trigger');
+          const evidence = stopEvidence;
+          contact.pauseDetail = { version: 1, epoch: contact.epoch, sequence: contact.sequence + 1, at,
+            source: 'explicit-rule', basis: 'explicit-stop', reason: 'explicit-stop', evidence,
+            evidenceHash: evidence === null ? null : digest(evidence) };
           for (const intent of next.intents) if (intent.scope === scope && cancellable.has(intent.status)) markCancelled(intent, 'participant-stopped', at);
+        } else if (activePause(contact, pauseClock())) {
+          // Only this newly accepted real receipt cancels its own cooldown.
+          // Hot/archive duplicate returns above never reach this branch, and a
+          // new explicit stop takes priority. Keep old epochs/intents invalid.
+          contact.pauseWindow = { ...contact.pauseWindow, cancelledAt: at, cancelledBySequence: contact.sequence + 1 };
         }
         contact.sequence++; contact.lastIncomingAt = at;
-        const receipt = { key, fingerprint, epoch: contact.epoch, sequence: contact.sequence, stop, at };
+        const receipt = { key, fingerprint, epoch: contact.epoch, sequence: contact.sequence, stop, at,
+          delivery: { state: stop ? 'uncertain' : 'received', at, ...(epochToken ? { epochToken: clone(epochToken) } : {}) } };
         contact.receipts.push(receipt); await persist(next); return tokenFor(contact, receipt);
       })).finally(() => {
         if (fence) { const pending = pendingStops.get(scope); pending?.delete(fence); if (!pending?.size) pendingStops.delete(scope); }
@@ -496,16 +880,18 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
           || !time(input.notBefore) || !time(input.expiresAt) || input.expiresAt <= input.notBefore) throw TypeError('Invalid contact intent');
         const payload = { id: input.id, scope: input.scope, epoch: input.epoch, ...(input.sequence != null ? { sequence: input.sequence } : {}), sources: sourceList(input.sources, input.scope),
           reason: requiredText(input.reason, 'contact intent reason', 500), notBefore: input.notBefore, expiresAt: input.expiresAt };
-        const old = findIntent(input.id);
+        const old = findIntent(input.id) || await archived('intents', input.id);
         if (old) {
-          if (Object.keys(payload).some(key => JSON.stringify(payload[key]) !== JSON.stringify(old[key]))) throw Error('Contact intent id has different content');
+          if (old.payloadHash ? old.payloadHash !== digest(JSON.stringify(payload))
+            : Object.keys(payload).some(key => JSON.stringify(payload[key]) !== JSON.stringify(old[key]))) throw Error('Contact intent id has different content');
           return { accepted: true, id: old.id, duplicate: true, status: old.status };
         }
         const at = stamp();
         if (input.expiresAt - at > policy.maxIntentLifetimeMs) throw TypeError('Contact intent lifetime exceeds its limit');
         if (!activeIntent({ ...payload })) return { accepted: false, reason: 'contact-stopped-stale-or-expired' };
-        if (state.intents.length >= policy.maxIntents) { fault = Error('Contact intent capacity exceeded; preserve claims for maintenance'); throw fault; }
-        const next = clone(state); next.intents.push({ ...payload, createdAt: at, status: 'pending' }); await persist(next);
+        const next = clone(state); await maintain(next, { intents: 1 });
+        if (next.intents.length >= policy.maxIntents) return { accepted: false, reason: 'contact-intent-capacity' };
+        next.intents.push({ ...payload, createdAt: at, status: 'pending' }); await persist(next);
         return { accepted: true, id: payload.id, duplicate: false, status: 'pending' };
       }));
     },
@@ -588,10 +974,13 @@ export async function createLifeContacts({ directory, timeline, now = Date.now, 
       if (closingTask) return closingTask;
       closed = true;
       closingTask = (async () => {
-        await Promise.allSettled([...operations]); await tail;
-        if (fault) throw Error('Contact coordination needs recovery after a persistence failure');
+        try {
+          await Promise.allSettled([...operations]); await tail;
+          if (fault) throw Error('Contact coordination needs recovery after a persistence failure');
+        } finally { await releaseWriter(); }
       })(); return closingTask;
     }
   };
   return api;
+  } catch (error) { await releaseWriter(); throw error; }
 }

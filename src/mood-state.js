@@ -97,8 +97,8 @@ function makeContext(state, allowStart) {
   return [
     '知微的短期小情绪（仅当前聊天中的当前说话者；内部状态，不能展示字段、标签或机制）：',
     `当前状态：${current}`,
-    state ? '保持这一件小事作为原因，不换理由、不编造其他人过去做过的事。起初可以短一点、嘴硬一点、略显不耐烦；被问怎么了时再说清原因，别无限卖关子。认真理解原因、合适安慰或实际帮助都可以让你缓和；不要求对方答中固定台词。'
-      : allowStart ? '默认自然友好。仅语境确实合适时，偶尔可以有一点因小事而起的别扭；原因可来自已发生的当前互动，或已有的角色生活线索，如先前提过解谜卡住、找不到喜欢的杯子。没有这些线索时可以平常地聊天；不能编造对方做过的事，也不把每次问候都写成生气。' : '这段小情绪已结束或正在自然平复；正常回应，不再新开一轮生气，不复述旧原因。',
+    state ? '保持已记录的原因，不换理由、不编造其他人过去做过的事；表达由眼前互动决定，不预设固定脾气或安慰流程。被问原因时可以直接说清。认真理解原因、合适安慰或实际帮助都可以让你缓和；不要求对方答中固定台词。'
+      : allowStart ? '当前没有需要延续的小情绪，按眼前互动回应。只有已发生的当前互动或已有生活记录确实支持时，才提出轻微情绪变化；没有依据就保持平常，不为表现性格编造原因。' : '这段小情绪已结束或正在自然平复；正常回应，不再新开一轮生气，不复述旧原因。',
     '用户暂时不回、换话题或去忙都不是轻视，不因此加重情绪；只有对方明确嘲弄或敷衍这件事时，才可稍微更别扭。强度最多轻微抗议，不羞辱、威胁、索取陪伴、逼人道歉或拒绝实际帮助。不把对一个人的情绪迁到另一位私聊对象身上。',
     '小情绪会随时间自然淡去，不要求对方必须哄好你。严肃求助、真实痛苦优先回应对方；管理指令和功能正常执行。当前短期情绪只影响自然表达，不擅自改变回应资格、消息处理速度或实际能力。',
     '若本轮确实建立或改变上述状态，在自然文字和可选表情之后仅附一个内部标记 [[qq_mood:{"phase":"guarded","cause":"具体小事","intensity":1}]]。phase 只能是 neutral/guarded/explained/easing，intensity 是 0/1/2。neutral 使用 0；新情绪只能轻微（1）。原因一旦确立就不改。没有状态变化就不要附标记。标记不是给用户看的。',
@@ -128,7 +128,7 @@ export class MoodState {
       const publicResult = { context: '', active: false, bypassed: true };
       this.prepared.set(event, { bypassed: true, public: publicResult }); return publicResult;
     }
-    const key = { scope, source, topic: `mood:${String(event.senderId).slice(0, 90)}` };
+    const key = { scope, source, topic: `mood:${scope.replace(/^(?:qq:private:|private:user:)/, '').slice(0, 90)}` };
     const entry = await this.memory.readLatestState(key);
     const value = decode(entry);
     const state = effective(value, at);
@@ -178,6 +178,24 @@ export class MoodState {
     if (!item) return { ok: false, reason: 'No pending mood change' };
     if (this.now() >= item.value.expiresAt) return { ok: false, reason: 'Mood change expired' };
     return this.memory.compareAndSetState({ ...item.snapshot.key,
-      expectedId: item.snapshot.entry?.id || null, summary: JSON.stringify(item.value) });
+      expectedId: item.snapshot.entry?.id || null, summary: JSON.stringify(item.value), epochToken: event.memoryEpochToken });
+  }
+
+  exportPending(event) {
+    const item = this.pending.get(event);
+    return item ? { version: 1, key: structuredClone(item.snapshot.key), expectedId: item.snapshot.entry?.id || null,
+      value: structuredClone(item.value), epochToken: structuredClone(event.memoryEpochToken) } : null;
+  }
+
+  async commitProjection(material, deliveryId) {
+    if (!material) return { ok: true, skipped: true, reason: 'no-mood-change' };
+    if (material.version !== 1 || !material.key || material.key.source !== source
+      || !decode({ summary: JSON.stringify(material.value) })) throw Error('Invalid mood projection');
+    // An expired proposal is deliberately closed rather than replaying an old mood.
+    if (this.now() >= material.value.expiresAt) return { ok: true, skipped: true, reason: 'mood-expired' };
+    const result = await this.memory.compareAndSetState({ ...material.key, expectedId: material.expectedId,
+      summary: JSON.stringify(material.value), epochToken: material.epochToken, deliveryId });
+    if (['Stale runtime state','memory-epoch-changed'].includes(result.reason)) return { ...result, ok: true, skipped: true };
+    return result;
   }
 }

@@ -11,7 +11,7 @@
   <main class="shell">
     <header class="page-head">
       <div><p class="eyebrow">ZHIWEI / OBSERVER</p><h1>生活观察</h1><p class="subhead">看看念头、兴趣和经历，如何随时间留下痕迹。</p></div>
-      <div class="head-links"><span class="badge">只读 · 公共生活</span><a href="/index.html">返回中枢 ↗</a></div>
+      <div class="head-links"><span class="badge">只读 · 开发者观察</span><a href="/index.html">返回中枢 ↗</a></div>
     </header>
     <section class="toolbar" aria-label="报告范围">
       <label>查看范围<select id="range"><option value="7">最近 7 天</option><option value="1">指定一天</option></select></label>
@@ -25,6 +25,16 @@
       <article class="stat"><span>新念头</span><strong id="thoughtCount">—</strong><p>在所选范围内留下的新念头</p></article>
       <article class="stat"><span>已完成活动</span><strong id="activityCount">—</strong><p>只计算完成，计划和中断不计入</p></article>
       <article class="snapshot"><span id="completeness" class="badge neutral">正在读取</span><p id="window">—</p><p id="cutoff" class="hint">—</p><p id="snapshot" class="hint"></p></article>
+    </section>
+    <section class="panel" aria-labelledby="operationsHeading">
+      <div class="section-head"><h2 id="operationsHeading">当前运行情况</h2><span class="unit">只读诊断</span></div>
+      <p class="section-note">显示当前尝试与等待原因，不随上方历史日期回溯。对方发来新私聊消息会结束该对象的主动联系冷却。</p>
+      <div id="operations"><p class="empty">正在读取…</p></div>
+    </section>
+    <section class="panel" aria-labelledby="contactPausesHeading">
+      <div class="section-head"><h2 id="contactPausesHeading">主动联系冷却</h2><span id="contactPausesCount" class="unit">正在读取</span></div>
+      <p class="section-note">每次有效触发后，两小时内不主动联系；到期或对方主动发来新私聊消息时结束冷却。新的停扰要求仍会重新计时。是否联系由当时意愿和时机决定，不保证恢复后立即发消息。当前状态不随历史日期回溯，以下私聊依据不进入公共生活报告或导出的 JSON。</p>
+      <div id="contactPauses" aria-live="polite"><p class="empty">正在读取主动联系冷却记录…</p></div>
     </section>
     <section class="panel" aria-labelledby="interestHeading">
       <div class="section-head"><div><p class="eyebrow">INTERESTS</p><h2 id="interestHeading">兴趣的变化</h2></div><span class="unit">内部强度 0—1</span></div>

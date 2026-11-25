@@ -1,9 +1,11 @@
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, rm, readFile } from 'node:fs/promises';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { createBrowserReader, isPublicAddress, validatePublicUrl, checkReadRequest, sanitizePageSnapshot, isXBrowserUrl, inspectXReadiness } from '../src/browser-reader.js';
+import { inspectXStatus } from '../src/x-status.js';
+import { createBrowserReader, isPublicAddress, validatePublicUrl, checkReadRequest, sanitizePageSnapshot, isXBrowserUrl, inspectXReadiness, inspectXhsReadiness, XHS_READ_SEARCH_POST_ENDPOINTS } from '../src/browser-reader.js';
 
 const publicLookup = async () => [{ address: '93.184.216.34', family: 4 }];
 const snapshot = () => ({ title: '一篇真实页面', text: '这里是已经渲染的正文，包含一段足够长的可读内容，用于验证阅读和截图流程。', links: [{ title: '下一篇', url: 'https://example.com/next' }], images: [0, 1] });
@@ -34,6 +36,29 @@ test('X HomeTimeline allowance is exact and cannot authorize adjacent queries or
   for (const method of ['PUT', 'PATCH', 'DELETE']) assert.throws(() => checkReadRequest(home, { ...options, method }));
 });
 
+test('built-in XHS search POST allowances require the exact endpoint and actual search document', () => {
+  const documentUrl = 'https://www.xiaohongshu.com/search_result/?keyword=%E6%98%9F%E4%BA%91';
+  for (const endpoint of XHS_READ_SEARCH_POST_ENDPOINTS) {
+    assert.equal(checkReadRequest(endpoint, { method: 'POST', resourceType: 'xhr', documentUrl }), endpoint);
+    assert.equal(checkReadRequest(endpoint, { method: 'OPTIONS', resourceType: 'other', documentUrl }), endpoint);
+    for (const source of [undefined, 'https://example.org/search_result?keyword=星云', 'https://www.xiaohongshu.com.evil.com/search_result?keyword=星云',
+      'http://www.xiaohongshu.com/search_result?keyword=星云', 'https://www.xiaohongshu.com/search_result', 'https://www.xiaohongshu.com/search_result?keyword=%20',
+      'https://www.xiaohongshu.com/user/profile/me?keyword=星云']) {
+      assert.throws(() => checkReadRequest(endpoint, { method: 'POST', resourceType: 'xhr', documentUrl: source }));
+    }
+    for (const url of [endpoint + '?extra=1', endpoint + '/suffix', endpoint.replace('https:', 'http:'), endpoint.replace('.com/', '.com.evil.org/')]) {
+      assert.throws(() => checkReadRequest(url, { method: 'POST', resourceType: 'xhr', documentUrl }));
+    }
+    for (const [method, resourceType] of [['POST', 'document'], ['POST', 'eventsource'], ['DELETE', 'xhr'], ['PUT', 'fetch']]) {
+      assert.throws(() => checkReadRequest(endpoint, { method, resourceType, documentUrl }));
+    }
+  }
+  for (const path of ['https://so.xiaohongshu.com/api/sns/web/search/history/sync', 'https://edith.xiaohongshu.com/api/sns/web/v1/note/like',
+    'https://edith.xiaohongshu.com/api/sns/web/v1/config', 'https://edith.xiaohongshu.com/api/redcaptcha/v2/getconfig']) {
+    assert.throws(() => checkReadRequest(path, { method: 'POST', resourceType: 'xhr', documentUrl }));
+  }
+});
+
 test('login and verification pages are withheld from the model; unsafe links are omitted', () => {
   for (const change of [{ password: true }, { text: '扫码登录后查看内容' }, { challenge: true }]) {
     const result = sanitizePageSnapshot({ ...snapshot(), ...change }, 'https://example.com/');
@@ -56,19 +81,28 @@ class FakePage extends EventEmitter {
   async goto(url) { assert.equal(this.closed, false); this.address = this.context.redirect || url; this.context.visited.push(url); }
   url() { return this.address; }
   async waitForLoadState() {}
-  async evaluate(fn) { return fn === inspectXReadiness ? this.context.xReadiness : { ...this.context.snapshot }; }
+  async evaluate(fn, target) {
+    if (fn === inspectXStatus) {
+      if (this.context.statusSnapshots?.length) return this.context.statusSnapshots.shift();
+      return this.context.xReadiness === 'ready'
+        ? {id:target.statusId, reason:'ready', text:this.context.snapshot.text, captions:[], links:[], imageCount:0}
+        : {reason:this.context.xReadiness || 'target_not_rendered'};
+    }
+    return fn === inspectXReadiness ? this.context.xReadiness : fn === inspectXhsReadiness ? this.context.xhsReadiness : { ...this.context.snapshot }; }
   async waitForFunction(fn, target, options) {
-    assert.equal(fn, inspectXReadiness);
+    assert.ok(fn === inspectXReadiness || fn === inspectXStatus || fn === inspectXhsReadiness);
     this.context.waits.push({ target, options });
-    if (!this.context.xReadiness) { const error = new Error('fixture content deadline'); error.name = 'TimeoutError'; throw error; }
-    return { jsonValue: async () => this.context.xReadiness, dispose: async () => {} };
+    const readiness = fn === inspectXReadiness || fn === inspectXStatus ? this.context.xReadiness : this.context.xhsReadiness;
+    if (!readiness) { const error = new Error('fixture content deadline'); error.name = 'TimeoutError'; throw error; }
+    return { jsonValue: async () => readiness, dispose: async () => {} };
   }
+  async evaluateHandle() { return { asElement:() => this.context.capturePhoto, dispose:async () => {} }; }
   locator(selector) { return { selector, nth: index => ({ screenshot: async () => Buffer.from(`image-${index}`) }) }; }
   async screenshot(options) { this.shots.push(options); return Buffer.from('page image'); }
 }
 class FakeContext extends EventEmitter {
   constructor(options, { exitOnLastPage = false, restorePage = false } = {}) {
-    super(); this.options = options; this.connected = true; this.tabs = []; this.visited = []; this.snapshot = snapshot(); this.offline = []; this.waits = []; this.xReadiness = false;
+    super(); this.options = options; this.connected = true; this.tabs = []; this.visited = []; this.snapshot = snapshot(); this.offline = []; this.waits = []; this.xReadiness = false; this.xhsReadiness = false;
     this.exitOnLastPage = exitOnLastPage;
     if (restorePage) this.tabs.push(new FakePage(this));
   }
@@ -198,13 +232,107 @@ test('login challenges skip screenshots and all following requests remain paused
   assert.equal(contexts[0].pages()[0].shots.length, 0); assert.equal(contexts[0].offline.at(-1), true);
 });
 
-test('search targets preserve platform-specific destinations with escaped queries', async t => {
+test('all legacy keyword hints use the same Xiaohongshu search and preserve the exact query', async t => {
   const { reader, contexts } = await fixture(t);
-  await reader.search('巧克力 & 猫', { platform: 'x' });
-  assert.equal(new URL(contexts[0].visited.at(-1)).searchParams.get('q'), '巧克力 & 猫');
-  await reader.search('春天', { platform: 'xiaohongshu' });
-  assert.equal(new URL(contexts[0].visited.at(-1)).hostname, 'www.xiaohongshu.com');
+  for (const platform of [undefined, 'web', 'x', 'twitter', 'xhs', 'xiaohongshu']) {
+    await reader.search('巧克力 & 猫', { platform });
+    const url = new URL(contexts[0].visited.at(-1));
+    assert.equal(url.origin + url.pathname, 'https://www.xiaohongshu.com/search_result');
+    assert.equal(url.searchParams.get('keyword'), '巧克力 & 猫');
+  }
   await assert.rejects(reader.search('话题', { platform: 'unsupported' }), /平台/);
+});
+
+test('old search URLs including redirect destinations stop before navigation without blocking original articles or assets', async t => {
+  const { reader, contexts } = await fixture(t);
+  const old = 'https://x.com/search?q=do-not-forward';
+  assert.equal((await reader.read(old)).blockedReason, 'search_source_retired'); assert.equal(contexts.length, 0);
+  await reader.start(); const context = contexts[0];
+  for (const url of [old, 'https://www.bing.com/search?q=old', 'https://html.duckduckgo.com/html/?q=old', 'https://www.google.co.jp/search?q=old'])
+    assert.equal(await routeResult(context, url), 'abort');
+  assert.equal(await routeResult(context, old, 'GET', 'xhr'), 'continue');
+  assert.equal(await routeResult(context, 'https://x.com/person/status/123'), 'continue');
+  assert.equal(await routeResult(context, 'https://example.org/search?q=article'), 'continue');
+  context.redirect = old;
+  assert.equal((await reader.read('https://example.org/forward')).blockedReason, 'search_source_retired');
+});
+
+test('only an explicit visible search empty component can establish zero results', () => {
+  for (const [label, bodyText, inResults, expected] of [
+    ['暂无相关笔记', '搜索 暂无相关笔记', true, 'empty'],
+    ['暂无相关笔记', '搜索失败 暂无相关笔记', true, 'xhs_read_failed'],
+    ['暂无相关笔记', '扫码登录 暂无相关笔记', true, 'login_required'],
+    ['暂无相关笔记', '安全验证 暂无相关笔记', true, 'human_verification_required'],
+    ['暂无相关笔记', '首页 发布 消息 暂无相关笔记', false, false],
+    ['暂无搜索记录', '搜索 暂无搜索记录', true, false]
+  ]) {
+    const node = { innerText: label, parentElement: null, getClientRects: () => [{}],
+      closest: selector => selector.startsWith('.search-layout') && inResults ? {} : null };
+    const document = { body: { innerText: bodyText }, querySelectorAll: selector => selector.startsWith('.empty-container') ? [node] : [] };
+    assert.equal(runInNewContext('(' + inspectXhsReadiness.toString() + ')({kind:"search"})', { document, getComputedStyle: () => ({}) }), expected);
+  }
+  const url = 'https://www.xiaohongshu.com/search_result?keyword=星云', empty = { ...snapshot(), links: [] };
+  assert.equal(sanitizePageSnapshot(empty, url, { xhsSearchEmpty: true, xhsContentReady: false }).blockedReason, 'search_no_results');
+  assert.equal(sanitizePageSnapshot(empty, url, { xhsSearchEmpty: true, xhsReadFailed: true }).blockedReason, 'xhs_read_failed');
+});
+
+test('note evidence is restricted to the current note description and omitted on a challenge or an unrelated page', async t => {
+  const { reader, contexts } = await fixture(t);
+  const url = 'https://www.xiaohongshu.com/explore/note123', detail = { title: '标题', text: '已渲染的笔记作者正文' };
+  await reader.start(); const context = contexts[0]; context.xhsReadiness = 'ready';
+  context.snapshot = { ...snapshot(), noteDetail: detail };
+  const note = await reader.read(url, { captureImages: false });
+  assert.deepEqual(note.noteDetail, detail); assert.deepEqual(note.imagePaths, []); assert.equal(context.pages()[0].shots.length, 0);
+  assert.equal((await reader.read('https://example.org/article')).noteDetail, undefined);
+  context.xhsReadiness = 'human_verification_required';
+  assert.equal((await reader.read(url)).noteDetail, undefined);
+});
+
+test('cancelling a chat navigation closes its own tab and leaves the reader available offline', async t => {
+  const { reader, contexts } = await fixture(t);
+  await reader.start(); const context = contexts[0];
+  let entered;
+  const begun = new Promise(resolve => { entered = resolve; }), makeTab = context.newPage.bind(context);
+  context.newPage = async () => {
+    const tab = await makeTab();
+    tab.goto = () => new Promise((resolve, reject) => { tab.once('close', () => reject(Error('tab closed'))); entered(); });
+    return tab;
+  };
+  const ctl = new AbortController();
+  const pending = reader.search('星云', { signal: ctl.signal, captureImages: false });
+  await begun; ctl.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(reader.status().busy, false); assert.equal(context.offline.at(-1), true);
+  context.newPage = makeTab;
+  assert.equal((await reader.read('https://example.org/article')).blockedReason, undefined);
+});
+
+test('actual reader route enables only XHS search POST in its own main search page', async t => {
+  const { reader, contexts } = await fixture(t);
+  await reader.start(); const context = contexts[0]; context.xhsReadiness = 'ready';
+  context.snapshot = { ...snapshot(), links: [{ title: '星云照片', url: 'https://www.xiaohongshu.com/search_result/note123' }] };
+  await reader.search('星云', { platform: 'xiaohongshu' });
+  for (const endpoint of XHS_READ_SEARCH_POST_ENDPOINTS) assert.equal(await routeResult(context, endpoint, 'POST', 'xhr'), 'continue');
+  assert.equal(await routeResult(context, 'https://so.xiaohongshu.com/api/sns/web/search/history/sync', 'POST', 'xhr'), 'abort');
+  await reader.read('https://example.org/article');
+  for (const endpoint of XHS_READ_SEARCH_POST_ENDPOINTS) assert.equal(await routeResult(context, endpoint, 'POST', 'xhr'), 'abort');
+});
+
+test('XHS content wait rejects shell and failed empty states and respects real login/challenge evidence', async t => {
+  const { reader, contexts } = await fixture(t, { timeoutMs: 1000 });
+  await reader.start(); const context = contexts[0];
+  context.snapshot = { ...snapshot(), text: '首页 发布 通知 消息 我 全部 图文 视频 用户 暂无相关笔记', images: [] };
+  for (const [readiness, expected] of [[false, 'xhs_content_not_ready'], ['xhs_read_failed', 'xhs_read_failed'],
+    ['login_required', 'login_required'], ['human_verification_required', 'human_verification_required']]) {
+    context.xhsReadiness = readiness;
+    const out = await reader.search('星云', { platform: 'xiaohongshu' });
+    assert.equal(out.blockedReason, expected); assert.deepEqual(out.links, []); assert.deepEqual(out.imagePaths, []);
+    assert.equal(out.requiresLogin, readiness === 'login_required'); assert.equal(context.offline.at(-1), true);
+    assert.deepEqual(context.waits.at(-1), { target: { kind: 'search', noteId: null }, options: { polling: 100, timeout: 1000 } });
+  }
+  context.xhsReadiness = 'ready'; context.snapshot = { ...snapshot(), text: '星云', links: [{ title: '星云', url: 'https://www.xiaohongshu.com/explore/note123' }] };
+  const out = await reader.read('https://www.xiaohongshu.com/search_result/note123?xsec_token=public-link-token');
+  assert.equal(out.blockedReason, undefined); assert.equal(context.waits.at(-1).target.noteId, 'note123'); assert.ok(out.imagePaths.length > 0);
 });
 
 test('X feeds wait for actual content; empty shells are not returned as successful reads', async t => {
@@ -222,7 +350,7 @@ test('X feeds wait for actual content; empty shells are not returned as successf
   assert.equal((await reader.read('https://x.com/person/status/12345')).blockedReason, undefined);
   context.snapshot = snapshot();
   context.xReadiness = false;
-  const empty = await reader.search('astronomy', { platform: 'x' });
+  const empty = await reader.read('https://x.com/home');
   assert.equal(empty.blockedReason, 'x_content_not_ready');
   assert.deepEqual(empty.links, []); assert.deepEqual(empty.imagePaths, []);
   assert.doesNotMatch(empty.text, /已经渲染的正文/);
@@ -289,4 +417,54 @@ test('failed browser close preserves the live context and stops profile/mode tra
   } finally { context.failClose = false; }
   await reader.close();
   assert.equal(reader.status().running, false);
+});
+
+test('X original reads expose the requested author and their safe links, with no whole-page screenshot', async t => {
+  const {reader,contexts} = await fixture(t);
+  await reader.start();
+  const c = contexts[0], url = 'https://x.com/person/status/410';
+  c.xReadiness = 'ready';
+  c.statusSnapshots = [{reason:'ready',text:'苹果原文',captions:['果皮细节'],imageCount:0,links:[
+    {title:'原帖引用的文章',url:'https://example.org/article'}, {title:'不能取用',url:'http://127.0.0.1/private'}]}];
+  const result = await reader.read(url);
+  assert.equal(result.text,'苹果原文\n果皮细节');
+  assert.deepEqual(result.xStatus,{id:'410',text:'苹果原文',captions:['果皮细节']});
+  assert.deepEqual(result.links,[{title:'原帖引用的文章',url:'https://example.org/article'}]);
+  assert.deepEqual(result.imagePaths,[]);
+  assert.equal(c.pages()[0].shots.length,0);
+  c.redirect = 'https://x.com/person/status/411';
+  assert.equal((await reader.read(url)).blockedReason,'x_status_mismatch');
+  c.redirect = 'https://x.com/i/flow/login';
+  assert.equal((await reader.read(url)).blockedReason,'login_required');
+});
+
+test('X cold empty document is opened once more; an access gate or repeated empty shell ends the read', async t => {
+  const {reader,contexts} = await fixture(t);
+  await reader.start();
+  const c = contexts[0], url = 'https://x.com/person/status/501';
+  c.xReadiness = 'ready';
+  c.statusSnapshots = [{reason:'empty_shell'},{reason:'ready',text:'开页完成',captions:[],links:[],imageCount:0}];
+  assert.equal((await reader.read(url)).text,'开页完成');
+  assert.equal(c.visited.length,2);
+  c.statusSnapshots = [{reason:'empty_shell'},{reason:'empty_shell'}];
+  assert.equal((await reader.read(url)).blockedReason,'x_content_not_ready');
+  assert.equal(c.visited.length,4);
+  c.statusSnapshots = [{reason:'human_verification_required'}];
+  assert.equal((await reader.read(url)).blockedReason,'human_verification_required');
+  assert.equal(c.visited.length,5);
+});
+
+test('an X photograph without a caption counts only when its original media is delivered', async t => {
+  const {reader,contexts} = await fixture(t);
+  await reader.start();
+  const c = contexts[0], url = 'https://x.com/person/status/502';
+  c.xReadiness = 'ready';
+  for (const mode of ['text-only','detached','captured']) {
+    c.statusSnapshots = [{reason:'ready',text:'',captions:[],links:[],imageCount:1}];
+    c.capturePhoto = mode === 'captured' ? { screenshot:async () => Buffer.from('original media pixels') } : null;
+    const result = await reader.read(url, {captureImages:mode !== 'text-only'});
+    assert.equal(result.blockedReason,mode === 'captured' ? undefined : 'x_media_without_author_text');
+    assert.equal(result.imagePaths.length,mode === 'captured' ? 1 : 0);
+    assert.equal(c.pages()[0].shots.length,0);
+  }
 });

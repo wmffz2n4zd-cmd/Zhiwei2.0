@@ -1,6 +1,7 @@
 'use strict';
 const el = id => document.getElementById(id);
 let token = null, currentReport = null, loading = false;
+let contactPauseView = null, contactPauseStartedAt = 0, contactPauseTimer = null;
 const number = value => Number.isFinite(value) ? value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : '未知';
 const delta = value => Number.isFinite(value) ? `${value > 0 ? '+' : ''}${number(value)}` : '未知';
 const time = value => Number.isFinite(value) ? new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(value) : '未知时间';
@@ -84,6 +85,110 @@ function renderEvents(report) {
     relations(details, item.relations); body.append(details); event.append(body); list.append(event);
   }
 }
+function renderOperations(operations) {
+  const parent = el('operations'); parent.replaceChildren();
+  if (!operations || !Object.keys(operations).length) return empty(parent, '尚无运行诊断。');
+  const names = { planner: '日常生活规划', browsing: '自主浏览', proactive: '主动联系', learning: '表达学习', contacts: '主动联系冷却' };
+  const reasons = { 'no-new-facts': '没有新事实，无需重复模型判断', declined: '这次没有浏览意愿', scheduled: '等待自己选定的时间',
+    'browser-busy': '浏览器正在使用或登录中', 'browser-disabled': '浏览未启用', 'life-busy': '当前活动忙碌，等空闲再看',
+    completed: '已取得真实浏览记录', 'no-reading': '没有可核实的浏览成果', 'reading-failed': '本次阅读失败',
+    'decision-failed': '本次意愿判断失败', 'existing-plans': '已有普通生活计划', waiting: '等待下次日常规划',
+    'contact-no-candidate': '当前没有适合主动联系的对象', 'contact-declined': '这次不想主动联系', 'contact-sent': '主动联系已送达',
+    'contact-not-sent': '本次没有发送', 'contact-send-uncertain': '发送结果未知', 'current-boundary': '当前认真或停止要求优先',
+    'proactive-paused': '最近判断时主动联系处于冷却期', 'no-relevant-learning': '没有适用的交流经验',
+    'reserved-until-delivery': '表达已参考，送达后再记录使用', selected: '已记录表达使用', 'stale-selection': '来源已变化，未记录旧表达',
+    'source-unavailable': '来源暂不可用', 'storage-unavailable': '当前状态暂不可写', cancelled: '旧意向已失效', 'driver-failed': '运行失败，需检查日志' };
+  for (const [name, item] of Object.entries(operations)) {
+    const row = node('div', null, 'evidence-card'); paragraph(row, names[name] || name);
+    if (item.enabled === false) paragraph(row, '未启用', 'hint');
+    else if (item.closed || item.stopped) paragraph(row, '已停止', 'hint');
+    if (name === 'contacts') paragraph(row, `已知联系人：${item.total ?? '未知'}。当前冷却对象与截止时间见下方。`);
+    const reason = item.lastResult || item.lastContextReason || item.lastDecision;
+    if (reason) paragraph(row, reasons[reason] || `状态：${reason}`);
+    if (item.lastDecision && item.lastDecision !== reason) paragraph(row, `最近决定：${reasons[item.lastDecision] || item.lastDecision}`, 'hint');
+    if (item.lastError) paragraph(row, `最近错误：${item.lastError}`, 'hint');
+    if (Number.isFinite(item.lastAttemptAt)) paragraph(row, `最近尝试 ${time(item.lastAttemptAt)}`, 'hint');
+    if (Number.isFinite(item.lastContextAt)) paragraph(row, `最近参考判断 ${time(item.lastContextAt)}`, 'hint');
+    if (Number.isFinite(item.nextAt)) paragraph(row, `普通规划下次可考虑 ${time(item.nextAt)}`, 'hint');
+    if (Number.isFinite(item.queued)) paragraph(row, `待执行浏览意向 ${item.queued}`, 'hint');
+    if (item.failed || item.degraded) paragraph(row, `局部状态待维护${item.warningCount ? `（${item.warningCount} 项）` : ''}`, 'hint');
+    parent.append(row);
+  }
+}
+function contactScopeKind(item) {
+  if (!item || typeof item.userId !== 'string' || typeof item.scope !== 'string' || item.scope.length > 160) return null;
+  if (/^[1-9]\d{0,127}$/.test(item.userId) && item.scope === `qq:private:${item.userId}`) return 'legacy';
+  if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(item.userId)
+    && item.scope === `private:user:${item.userId}`) return 'web';
+  return null;
+}
+function renderContactPauses(value) {
+  const sources = { 'explicit-rule': '明确停扰规则', 'contextual-model': '模型结合上下文判断', 'legacy-unknown': '历史依据不完整' };
+  const evidenceStates = new Set(['recorded', 'legacy-unavailable', 'removed-by-memory-reset']);
+  if (!value || !Array.isArray(value.contacts) || !Number.isFinite(value.at)
+    || value.contacts.some(item => !contactScopeKind(item)
+      || !Object.hasOwn(sources, item.source) || !evidenceStates.has(item.evidenceStatus)
+      || (item.pausedAt !== null && !Number.isFinite(item.pausedAt))
+      || !Number.isFinite(item.expiresAt)
+      || (item.evidenceStatus === 'recorded' && (typeof item.evidence !== 'string' || !item.evidence.trim())))) {
+    throw Error('当前冷却记录格式不完整');
+  }
+  clearContactPauseView();
+  contactPauseView = value; contactPauseStartedAt = performance.now();
+  paintContactPauses();
+}
+function clearContactPauseView() {
+  if (contactPauseTimer !== null) clearTimeout(contactPauseTimer);
+  contactPauseTimer = null; contactPauseView = null;
+}
+function paintContactPauses() {
+  const value = contactPauseView;
+  if (!value) return;
+  // Count from the server snapshot with monotonic elapsed time. Browser clock
+  // settings do not prolong a two-hour boundary or produce negative time.
+  const at = value.at + Math.max(0, performance.now() - contactPauseStartedAt);
+  const active = value.contacts.filter(item => item.expiresAt > at);
+  const sources = { 'explicit-rule': '明确停扰规则', 'contextual-model': '模型结合上下文判断', 'legacy-unknown': '历史依据不完整' };
+  const parent = el('contactPauses'); parent.replaceChildren();
+  el('contactPausesCount').textContent = `${active.length} 人冷却中`;
+  if (!value.contacts.length) empty(parent, '当前无人处于两小时主动联系冷却期。');
+  const reasons = { 'same-turn-contextual-impatience': '模型将当时本人话语结合上下文判断为明显不耐烦或要求收手。',
+    'contextual-impatience': '结合上下文判断为明显不耐烦或要求收手。',
+    'explicit-stop': '本人话语命中了明确停止联系的规则。',
+    'removed-by-memory-reset': '触发记录的原始内容已随记忆清理移除。',
+    'removed-by-maintenance': '历史记录已整理，原始判断详情不可用。' };
+  for (const item of value.contacts) {
+    const remaining = Math.max(0, item.expiresAt - at), cooling = remaining > 0;
+    const card = node('article', null, 'contact-pause'), heading = node('div', null, 'event-top');
+    heading.append(node('h3', `私聊对象 ${item.userId}`), node('span', cooling ? '冷却中' : '冷却已结束', cooling ? 'badge warning' : 'badge neutral')); card.append(heading);
+    if (contactScopeKind(item) === 'legacy') paragraph(card, '资料来源：旧 QQ 身份', 'hint');
+    paragraph(card, `判断来源：${sources[item.source]}`, 'hint');
+    paragraph(card, item.pausedAt === null ? '冷却起点：历史记录未保留' : `冷却起点：${time(item.pausedAt)}（北京时间）`, 'hint');
+    paragraph(card, `截止时间：${time(item.expiresAt)}（北京时间）`);
+    if (cooling) {
+      const minutes = Math.ceil(remaining / 60000), hours = Math.floor(minutes / 60), rest = minutes % 60;
+      const duration = remaining < 60000 ? '不足 1 分钟' : hours ? `${hours} 小时${rest ? ` ${rest} 分钟` : ''}` : `${minutes} 分钟`;
+      paragraph(card, `${remaining < 60000 ? '剩余' : '剩余约 '}${duration}（据服务器读取时刻计时）`, 'hint');
+    } else paragraph(card, '本次冷却已到期，自动恢复主动联系资格；不代表会立即发消息。', 'hint');
+    paragraph(card, '触发原话', 'hint');
+    if (item.evidenceStatus === 'recorded') card.append(node('blockquote', item.evidence, 'pause-evidence'));
+    else paragraph(card, item.evidenceStatus === 'removed-by-memory-reset'
+      ? '原话已随记忆清理移除，无法还原。' : '旧记录未保存原话，无法还原。', 'hint');
+    const reason = reasons[item.reason] || reasons[item.basis] || item.reason;
+    if (reason) paragraph(card, `判定原因：${reason}`);
+    else paragraph(card, item.source === 'explicit-rule' ? '判定原因：命中本人明确要求停止联系的规则。'
+      : item.source === 'contextual-model' ? '判定原因：当时模型判断应停止打扰。' : '判定原因：历史记录未保留完整依据。', 'hint');
+    parent.append(card);
+  }
+  paragraph(parent, `状态读取于 ${time(value.at)}（北京时间）`, 'hint');
+  if (active.length) contactPauseTimer = setTimeout(paintContactPauses,
+    Math.max(1, Math.min(60000, ...active.map(item => item.expiresAt - at))));
+}
+function contactPausesFailure() {
+  clearContactPauseView();
+  el('contactPausesCount').textContent = '状态未知';
+  el('contactPauses').replaceChildren(node('p', '冷却记录读取失败，无法判断当前受限人数或触发依据。请刷新重试。', 'empty pause-error'));
+}
 function render(report) {
   const complete = report.completeness.status === 'complete';
   el('thoughtCount').textContent = Number.isFinite(report.counts.newThoughts) ? report.counts.newThoughts : '—';
@@ -97,7 +202,7 @@ function render(report) {
   el('message').textContent = reasonLabels[report.completeness.reason] || (complete ? '已读取公共生活记录；所有统计和事件来自同一快照。' : '没有把未知状态当作零。');
   const warnings = report.completeness.warnings || [];
   if (warnings.length) el('message').textContent += ` ${warnings.join('；')}`;
-  renderInterests(report); renderEvents(report);
+  renderOperations(report.operations); renderInterests(report); renderEvents(report);
   el('notes').textContent = (report.notes || []).join(' ');
   el('download').disabled = report.window.days !== 1;
   el('exportHint').textContent = report.window.days === 1 ? '导出当前快照，不重新读取或生成。' : '选择一天后，可导出当前报告。';
@@ -106,22 +211,37 @@ async function get(path, headers) {
   const response = await fetch(path, { headers: { 'x-life-observer-client': 'developer', ...headers }, cache: 'no-store', credentials: 'same-origin' });
   const value = await response.json(); if (!response.ok) throw Error(value.error || '读取失败'); return value;
 }
+function reportFailure(error) {
+  currentReport = null;
+  el('message').textContent = error.message; el('message').className = 'message error';
+  el('thoughtCount').textContent = '—'; el('activityCount').textContent = '—'; el('completeness').textContent = '读取失败'; el('completeness').className = 'badge warning';
+  el('window').textContent = '—'; el('cutoff').textContent = '—'; el('snapshot').textContent = ''; el('notes').textContent = ''; el('eventCount').textContent = '';
+  el('download').disabled = true;
+  empty(el('interests'), '暂不显示旧快照，请重试读取。'); empty(el('events'), '暂不显示旧快照，请重试读取。');
+  empty(el('operations'), '暂不显示旧诊断，请重试读取。');
+}
 async function refresh() {
   if (loading) return; loading = true; el('refresh').disabled = true; el('download').disabled = true;
   el('range').disabled = true; el('date').disabled = true;
   el('message').textContent = '正在读取生活记录…'; el('message').className = 'message';
+  clearContactPauseView();
+  el('contactPausesCount').textContent = '正在读取'; empty(el('contactPauses'), '正在读取主动联系冷却记录…');
   try {
     if (!token) token = (await get('/api/life-observer/session')).token;
     const days = el('range').value, query = new URLSearchParams({ days });
     if (days === '1') query.set('date', el('date').value);
-    const report = await get('/api/life-observer/report?' + query, { 'x-life-observer-token': token });
-    render(report); currentReport = report;
+    const headers = { 'x-life-observer-token': token };
+    // Private pause evidence is kept out of currentReport and its export path.
+    // Each source can succeed independently, so a failed report never masks a pause.
+    const results = await Promise.allSettled([
+      get('/api/life-observer/report?' + query, headers).then(report => { render(report); currentReport = report; }),
+      get('/api/life-observer/contact-pauses', headers).then(renderContactPauses)
+    ]);
+    if (results[0].status === 'rejected') reportFailure(results[0].reason);
+    if (results[1].status === 'rejected') contactPausesFailure();
+    if (results.some(result => result.status === 'rejected')) token = null;
   } catch (error) {
-    token = null; currentReport = null;
-    el('message').textContent = error.message; el('message').className = 'message error';
-    el('thoughtCount').textContent = '—'; el('activityCount').textContent = '—'; el('completeness').textContent = '读取失败'; el('completeness').className = 'badge warning';
-    el('window').textContent = '—'; el('cutoff').textContent = '—'; el('snapshot').textContent = ''; el('notes').textContent = ''; el('eventCount').textContent = '';
-    empty(el('interests'), '暂不显示旧快照，请重试读取。'); empty(el('events'), '暂不显示旧快照，请重试读取。');
+    token = null; reportFailure(error); contactPausesFailure();
   } finally { loading = false; el('refresh').disabled = false; el('range').disabled = false; el('date').disabled = el('range').value !== '1'; }
 }
 el('date').value = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);

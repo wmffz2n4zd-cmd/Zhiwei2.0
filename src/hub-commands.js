@@ -8,8 +8,8 @@ const retiredInterestCommands = new Set(['兴趣', '兴趣测试', '兴趣添加
 export const commandHelp = [
   '/开始聊天测试 /结束聊天测试（仅当前管理员私聊）',
   '/关机 → /确认关机；60 秒内可 /取消关机',
-  '后台指令（不调用模型）：', '/状态 /开启QQ /关闭QQ',
-  '/QQ模型 名称 /私聊模型 名称', '/QQ智能等级 low|medium|high|xhigh /私聊智能等级 同上',
+  '后台指令（不调用模型）：', '/状态',
+  '/默认模型 名称 /私聊模型 名称', '/默认智能等级 low|medium|high|xhigh /私聊智能等级 同上',
   '/记忆 [关键词] /记住 内容 /交接 内容 /统一记忆状态',
   '/清除统一记忆 → /确认清除记忆', '/节点检查 /节点列表 /切换节点 节点名',
   '/脚本 /运行脚本 名称',
@@ -24,17 +24,23 @@ export function isHubCommand(text) {
   if (value.startsWith('/') && retiredInterestCommands.has(value.slice(1).split(/\s+/, 1)[0])) return true;
   if (/^\/(浏览|探索|浏览状态|留言板)(?:\s|$)/.test(value)) return true;
   if (/^\/(开始聊天测试|结束聊天测试|关机|确认关机|取消关机)(?:\s|$)/.test(value)) return true;
-  return /^\/(帮助|状态|开启QQ|关闭QQ|QQ模型|私聊模型|QQ智能等级|私聊智能等级|记忆|记住|交接|统一记忆状态|清除统一记忆|确认清除记忆|节点检查|节点列表|切换节点|脚本|运行脚本)(?:\s|$)/i.test(value);
+  return /^\/(帮助|状态|默认模型|私聊模型|默认智能等级|私聊智能等级|记忆|记住|交接|统一记忆状态|清除统一记忆|确认清除记忆|节点检查|节点列表|切换节点|脚本|运行脚本)(?:\s|$)/i.test(value);
 }
 export function runConfiguredScript(spec, cwd) {
   if (!spec?.command || !Array.isArray(spec.args) || spec.args.some(a => typeof a !== 'string')) throw Error('脚本需要配置固定 command 和 args 数组');
   return new Promise((resolve, reject) => {
-    const child = spawn(spec.command, spec.args, { cwd, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let output = '', timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill(); }, Math.min(spec.timeoutMs || 30000, 120000));
+    const grouped = process.platform !== 'win32';
+    const child = spawn(spec.command, spec.args, { cwd, shell: false, detached: grouped, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '', timedOut = false, escalation;
+    const stop = signal => {
+      try { if (grouped && child.pid > 0) process.kill(-child.pid, signal); else child.kill(signal); }
+      catch (error) { if (error.code !== 'ESRCH') { try { child.kill(signal); } catch {} } }
+    };
+    const timeout = Number.isFinite(spec.timeoutMs) ? Math.max(1, Math.min(spec.timeoutMs, 120000)) : 30000;
+    const timer = setTimeout(() => { timedOut = true; stop('SIGTERM'); escalation = setTimeout(() => stop('SIGKILL'), 1000); }, timeout);
     for (const stream of [child.stdout, child.stderr]) stream.on('data', b => { output = (output + b).slice(-3000); });
-    child.once('error', error => { clearTimeout(timer); reject(error); });
-    child.once('close', code => { clearTimeout(timer); resolve(timedOut ? '脚本超时，已请求停止。' : `退出码 ${code}\n${output.trim()}`); });
+    child.once('error', error => { clearTimeout(timer); clearTimeout(escalation); reject(error); });
+    child.once('close', code => { clearTimeout(timer); clearTimeout(escalation); if (grouped) stop('SIGKILL'); resolve(timedOut ? '脚本超时，已停止。' : `退出码 ${code}\n${output.trim()}`); });
   });
 }
 export class HubCommands {
@@ -46,8 +52,9 @@ export class HubCommands {
   }
   testDecision(event) {
     if (!event.isOwner || event.type !== 'private_message' || /^\s*\//.test(event.text || '')) return null;
-    try { memoryScope(event); } catch { return null; }
-    if (this.chatTests.get(String(event.senderId)) !== 'chat') return null;
+    let scope;
+    try { scope = memoryScope(event); } catch { return null; }
+    if (this.chatTests.get(scope) !== 'chat') return null;
     return { ok: true, reason: 'Owner private chat test' };
   }
   async handle(event) {
@@ -57,7 +64,7 @@ export class HubCommands {
     let scope;
     try { scope = memoryScope(event); } catch { return '后台指令需要有效的管理员私聊对象。'; }
     const [command, ...parts] = text.slice(1).split(/\s+/); const arg = parts.join(' ');
-    const sender = String(event.senderId);
+    const sender = scope;
     if (retiredInterestCommands.has(command)) return '旧兴趣评分指令已停用，私聊不再按话题分数筛选。';
     if (['浏览', '探索', '浏览状态', '留言板'].includes(command)) {
       if (!this.world) return '本机尚未启用图文浏览，需在 world.enabled 开启后重启后台。';
@@ -85,7 +92,7 @@ export class HubCommands {
     if (command === '结束聊天测试') { this.chatTests.delete(sender); return '当前私聊测试已结束，恢复原来的私聊规则。'; }
     if (command === '关机') {
       this.shutdownRequests.set(sender, this.now() + 180000);
-      return '将停止知微消息服务，不关闭电脑或 QQ 客户端。3 分钟内发送 /确认关机，确认后等待 60 秒停止，可用 /取消关机 撤销。停止后需要在电脑上重新启动知微。';
+      return '将停止知微消息服务，服务器继续运行。3 分钟内发送 /确认关机，确认后等待 60 秒停止，可用 /取消关机 撤销。停止后需要由部署者重新启动知微服务。';
     }
     if (command === '取消关机') {
       this.shutdownRequests.delete(sender);
@@ -104,12 +111,8 @@ export class HubCommands {
       return '已确认，60 秒后停止知微消息服务，电脑继续运行。现在仍可发送 /取消关机。';
     }
     if (command === '帮助') return commandHelp;
-    if (command === '状态') return `QQ：${this.state.channels.qq ? '开' : '关'}\n聊天范围：仅私聊，群聊已禁用\n默认模型：${this.state.ai.model} / ${this.state.ai.reasoningEffort}\n私聊模型：${this.config.privateChatModel || this.state.ai.model} / ${this.config.privateChatReasoningEffort || this.state.ai.reasoningEffort}\n任务权限：workspace-write\n统一记忆：按对象隔离，结合相关内容和近期对话召回；旧记录不因年龄直接失效，无必要线索可不注入，缺前文最多补查一次。`;
-    if (/^(开启QQ|关闭QQ)$/i.test(command)) {
-      this.state.channels.qq = /^开启/i.test(command); this.config.qqEnabled = this.state.channels.qq;
-      await this.persist(); return `QQ 私聊响应已${this.state.channels.qq ? '开启' : '关闭'}；管理员私聊指令仍可使用。群聊继续禁用。`;
-    }
-    if (/^(QQ|私聊)(模型|智能等级)$/i.test(command)) {
+    if (command === '状态') return `网页：${this.state.channels.pwa ? '开' : '关'}\n聊天范围：仅私聊\n默认模型：${this.state.ai.model} / ${this.state.ai.reasoningEffort}\n私聊模型：${this.config.privateChatModel || this.state.ai.model} / ${this.config.privateChatReasoningEffort || this.state.ai.reasoningEffort}\n任务权限：workspace-write\n统一记忆：按对象隔离，结合相关内容和近期对话召回；旧记录不因年龄直接失效，无必要线索可不注入，缺前文最多补查一次。`;
+    if (/^(默认|私聊)(模型|智能等级)$/.test(command)) {
       const privateChat = command.startsWith('私聊'), model = command.endsWith('模型');
       if (model ? !/^[A-Za-z0-9._:-]{1,100}$/.test(arg) : !['low', 'medium', 'high', 'xhigh'].includes(arg)) return '参数格式无效；发送 /帮助 查看格式。';
       this.config[privateChat ? (model ? 'privateChatModel' : 'privateChatReasoningEffort') : (model ? 'chatModel' : 'chatReasoningEffort')] = arg;
@@ -120,7 +123,7 @@ export class HubCommands {
     if (command === '统一记忆状态') return JSON.stringify(await this.memory.status({ scope }));
     if (command === '记住' || command === '交接') {
       if (!arg) return `格式：/${command} 要保存的内容（后台直接保存，不调用模型）。`;
-      await this.memory.write({ scope, type: command === '交接' ? 'handoff' : 'preference', source: 'qq-command', summary: arg }); return '已保存到当前管理员私聊记忆。';
+      await this.memory.write({ scope, type: command === '交接' ? 'handoff' : 'preference', source: 'private-command', summary: arg }); return '已保存到当前管理员私聊记忆。';
     }
     if (command === '清除统一记忆') { this.clearRequests.set(scope, this.now() + 180000); return '将清除当前私聊的统一记忆；3 分钟内发送 /确认清除记忆。其他会话记忆不受影响。'; }
     if (command === '确认清除记忆') {

@@ -25,6 +25,46 @@ export function ensureStickerLeadText(reply) {
   return `${leadText[name] || '我在。'}\n${marker[0]}`;
 }
 
+const maxTextMessages = 5;
+const closingDelimiter = new Map(Object.entries({
+  '“': '”', '‘': '’', '「': '」', '『': '』', '《': '》', '【': '】',
+  '(': ')', '（': '）', '[': ']', '{': '}', '"': '"', "'": "'"
+}));
+
+function naturalParagraphBreak(text) {
+  const open = [];
+  let paragraph = 0;
+  const nearerMiddle = (current, offset) =>
+    !current || Math.abs(text.length / 2 - offset) < Math.abs(text.length / 2 - current) ? offset : current;
+  for (const match of text.matchAll(/\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*|[“”‘’「」『』《》【】()（）\[\]{}"']/gu)) {
+    const token = match[0], offset = match.index + token.length;
+    // Contractions, possessives (James' Bar) and inch marks are not open quotes.
+    if ((token === "'" || token === '"') && /[a-z\d]/iu.test(text[match.index - 1] || '')
+      && (open.at(-1) !== token || (token === "'" && /[a-z]/iu.test(text[offset] || '')))) continue;
+    if (token === open.at(-1)) open.pop();
+    else if (closingDelimiter.has(token)) open.push(closingDelimiter.get(token));
+    else if (!open.length && token.includes('\n')) paragraph = nearerMiddle(paragraph, offset);
+  }
+  return paragraph;
+}
+
+function naturalTextParts(value) {
+  const parts = [value.trim()];
+  while (parts.length < maxTextMessages) {
+    // Only the model's explicit paragraphs define possible bubbles. Sentence
+    // endings do not establish that an explanation or its conditions stand alone.
+    // Divide the longest remaining bubble so overflow stays reasonably balanced.
+    const candidates = parts.map((part, index) => ({ offset: naturalParagraphBreak(part), index, length: part.length }))
+      .filter(candidate => candidate.offset)
+      .sort((a, b) => b.length - a.length);
+    if (!candidates.length) break;
+    const { index, offset } = candidates[0];
+    const part = parts[index];
+    parts.splice(index, 1, part.slice(0, offset).trim(), part.slice(offset).trim());
+  }
+  return parts;
+}
+
 function naturalTextMessages(segments) {
   const texts = segments.filter(segment => segment.type === 'text');
   // Unknown rich segments and multiple text segments have their own layout;
@@ -34,10 +74,8 @@ function naturalTextMessages(segments) {
   const structured = /```|~~~/u.test(value)
     || /^(?:[ \t]{4}\S|\s*(?:#{1,6}\s|>|\||[-*+•]\s|(?:\d+|[一二三四五六七八九十]+)[.)、]\s*|[（(]\d+[）)]))/mu.test(value);
   if (structured) return [segments];
-  const paragraphs = value.split(/\r?\n[ \t]*\r?\n(?:[ \t]*\r?\n)*/u).map(part => part.trim()).filter(Boolean);
-  if (paragraphs.length < 2) return [segments];
-  // A bound on transport calls, not an instruction to manufacture three parts.
-  const parts = paragraphs.length > 3 ? [...paragraphs.slice(0, 2), paragraphs.slice(2).join('\n\n')] : paragraphs;
+  const parts = naturalTextParts(value);
+  if (parts.length < 2) return [segments];
   const text = texts[0];
   return parts.map((part, index) => {
     const next = { ...text, data: { ...text.data, text: part } };
@@ -57,9 +95,10 @@ async function sendNaturalTextThenSticker(message, send) {
   }
   const parts = [], delivered = [];
   let primary;
-  for (const part of naturalTextMessages(text)) {
+  const messages = naturalTextMessages(text);
+  for (const [index, part] of messages.entries()) {
     let result;
-    try { result = await send(part); }
+    try { result = await send(part, { textComplete: index === messages.length - 1 }); }
     catch { result = { ok: false, reason: 'Text delivery failed', uncertain: true }; }
     parts.push(result);
     if (!result?.ok) {

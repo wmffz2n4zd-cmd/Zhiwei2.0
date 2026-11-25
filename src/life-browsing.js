@@ -1,3 +1,21 @@
+// Old journals and queues keep their original platform fields and hashes.
+// Apply the current keyword route when proposing or executing an action.
+export function browsePlatformOptions({ target, platform }) {
+  if (!/^https?:\/\//i.test(target)) return { platform: 'xiaohongshu' };
+  return platform ? { platform } : {};
+}
+
+/** Only committed, same-scope world observations prove actual reading. */
+export function hasWorldReadingEvidence(result, state, scope = null) {
+  const refs = Array.isArray(result?.experienceRefs) ? [...new Set(result.experienceRefs)] : [];
+  const validRun = typeof result?.runId === 'string' && /^[a-f0-9-]{36}$/.test(result.runId);
+  return result?.status === 'complete' && validRun && refs.length > 0 && refs.length <= 8
+    && refs.every(ref => typeof ref === 'string' && ref.startsWith(`world:${result.runId}:`)
+      && state.events.some(event => event.type === 'experience-recorded' && event.experience?.id === ref
+        && event.experience.mode === 'external' && event.source.kind === 'world-reading'
+        && (event.source.scope || null) === (scope || null)));
+}
+
 /** A consumer of durable typed actions; the Hub's life timer is the only scheduler. */
 export function createLifeBrowsing({ timeline, world, now = Date.now } = {}) {
   if (!timeline || typeof timeline.claimAction !== 'function' || typeof world?.run !== 'function') throw TypeError('Life browsing needs a timeline and a world reader');
@@ -16,7 +34,8 @@ export function createLifeBrowsing({ timeline, world, now = Date.now } = {}) {
     if (!plan) return { kind: 'already-consumed' };
     let result;
     try {
-      result = await world.run(plan.action.target, { scope: plan.source.scope, canContinue: () => current(plan) });
+      result = await world.run(plan.action.target, { scope: plan.source.scope,
+        ...browsePlatformOptions(plan.action), canContinue: () => current(plan) });
     } catch {
       await timeline.failActivity(plan.id, 'reading-action-failed');
       return { kind: 'failed', planId: plan.id };
@@ -25,12 +44,7 @@ export function createLifeBrowsing({ timeline, world, now = Date.now } = {}) {
     // are evidence. A model's rest, a login page, or invented refs are not.
     const state = timeline.snapshot();
     const refs = Array.isArray(result?.experienceRefs) ? [...new Set(result.experienceRefs)] : [];
-    const validRun = typeof result?.runId === 'string' && /^[a-f0-9-]{36}$/.test(result.runId);
-    const proven = validRun && refs.length > 0 && refs.length <= 8 && refs.every(ref => typeof ref === 'string'
-      && ref.startsWith(`world:${result.runId}:`) && state.events.some(event => event.type === 'experience-recorded'
-        && event.experience?.id === ref && event.experience.mode === 'external'
-        && event.source.kind === 'world-reading' && (event.source.scope || null) === (plan.source.scope || null)));
-    if (result?.status !== 'complete' || !proven) {
+    if (!hasWorldReadingEvidence(result, state, plan.source.scope)) {
       await timeline.failActivity(plan.id, 'reading-result-without-evidence');
       return { kind: 'no-reading', planId: plan.id };
     }

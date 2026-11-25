@@ -1,3 +1,4 @@
+import { isPrivateScope, privateEventScope, privateScopeId } from './private-scope.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
@@ -6,9 +7,9 @@ import { dirname, join, resolve } from 'node:path';
 const VERSION = 1;
 const DEFAULTS = Object.freeze({ maxMessages: 12, maxMessageChars: 600, maxTextChars: 4000,
   maxEntries: 128, maxSeen: 2048, maxAgeMs: 24 * 60 * 60 * 1000, seenTtlMs: 48 * 60 * 60 * 1000 });
-const attemptStates = new Set(['claimed', 'sent', 'failed', 'uncertain']);
+const attemptStates = new Set(['claimed', 'sending', 'sent', 'failed', 'uncertain']);
 const clone = value => structuredClone(value);
-const scopeFor = event => `qq:private:${String(event.senderId)}`;
+const scopeFor = event => event.channel === 'pwa' && isPrivateScope(event.privateIdentity?.memoryScope) ? event.privateIdentity.memoryScope : `qq:private:${String(event.senderId)}`;
 const isPrivate = event => event?.type === 'private_message' && !event.groupId && event.senderId != null
   && String(event.senderId).length > 0 && String(event.senderId).length <= 128;
 
@@ -43,7 +44,9 @@ function readMessages(event, now, policy) {
 }
 
 function senderFor(event) {
-  return { senderId: String(event.senderId).slice(0, 128), selfId: String(event.selfId || '').slice(0, 128),
+  return { ...(event.channel === 'pwa' ? { channel: 'pwa', privateIdentity: clone(event.privateIdentity) } : {}),
+    ...(event.pwaScopeGeneration !== undefined ? {pwaScopeGeneration:event.pwaScopeGeneration} : {}),
+    senderId: String(event.senderId).slice(0, 128), selfId: String(event.selfId || '').slice(0, 128),
     senderName: cleanText(event.senderName, 80), senderLabel: cleanText(event.senderLabel, 80) };
 }
 
@@ -103,8 +106,10 @@ async function readState(path) {
   } finally { await handle.close(); }
 }
 
-function terminal(entry) { return Boolean(entry.discarded || (entry.replyAttempt && entry.replyAttempt.state !== 'claimed')); }
-function waiting(entry) { return !entry.discarded && !entry.replyAttempt; }
+function terminal(entry) { return Boolean(entry.discarded || ['sent', 'uncertain'].includes(entry.replyAttempt?.state)
+  || entry.replyAttempt?.state === 'failed' && !entry.replyAttempt.retryable); }
+function waiting(entry) { return !entry.discarded && (!entry.replyAttempt || entry.replyAttempt.state === 'failed' && entry.replyAttempt.retryable); }
+const inFlight = entry => ['claimed', 'sending'].includes(entry.replyAttempt?.state);
 
 function compact(state, now, policy) {
   for (const entry of state.entries) {
@@ -122,8 +127,11 @@ function compact(state, now, policy) {
 function mergedEvent(entry) {
   const text = entry.messages.map(message => message.text).join('\n');
   return { type: 'private_message', ...clone(entry.sender), text, images: [],
+    backendCommand: false,
     ...(entry.lifeContactToken ? { lifeContactToken: clone(entry.lifeContactToken) } : {}),
     ...(entry.lifeContactEvidence ? { lifeContactEvidence: clone(entry.lifeContactEvidence) } : {}),
+    ...(entry.lifeIncomingTokens ? { lifeIncomingTokens: clone(entry.lifeIncomingTokens) } : {}),
+    ...(entry.memoryEpochToken ? { memoryEpochToken: clone(entry.memoryEpochToken) } : {}),
     hasReplySegment: false, hasAudioSegment: false, hasAtSegment: false, hasSelfAtSegment: false,
     isReplyToSelf: false, lifeReplyEpisodeId: entry.id,
     raw: { post_type: 'message', message_type: 'private', user_id: entry.sender.senderId,
@@ -142,16 +150,17 @@ function resumeDetails(entry, timeline) {
   else if (outcome === 'completed') result = `先前活动「${latest?.title || '暂时忙碌'}」记录为结束；这里只提供状态，没有提供外部材料内容，不能据此声称读过具体内容。`;
   else if (['interrupted', 'failed', 'cancelled', 'missed'].includes(outcome)) result = `先前活动「${latest?.title || '暂时忙碌'}」状态为${({ interrupted: '中断', failed: '失败', cancelled: '取消', missed: '错过' })[outcome]}，不能说已完成、读完或补造离线经历。`;
   else result = '先前忙碌阶段现在已可回应，但活动结果没有确认，不要声称完成或补造经历。';
-  return { episodeId: entry.id, outcome, resumeContext: `${result}\n对方忙时的消息已合并在本次输入中；最多给一条自然回应，可以只简短提及刚才暂时忙，不逐条补答。图片和引用的标记表示尚未查看，不能猜测其中内容。` };
+  return { episodeId: entry.id, outcome, resumeContext: `${result}\n对方忙时的消息已合并在本次输入中；最多给一条自然回应，可以只简短提及刚才暂时忙，不逐条补答。图片和引用以本次实际提供的材料为准；只有占位时不能猜测其中内容。` };
 }
 
 /**
- * Durable, at-most-one-attempt reply coordination. The caller owns the directory
- * through life-timeline's single-writer lock and ticks that timeline first.
- * A claimed network operation is never automatically retried after a restart.
+ * Durable reply coordination. The caller owns the directory through the life
+ * writer lock. reply(event, details) MUST await details.markSending() immediately
+ * before actual transport. Generation may restart; a persisted sending claim
+ * with unknown outcome never automatically retries.
  */
 export async function createLifeReplies({ directory, timeline, now = Date.now,
-  isEligible, sendStatus, reply, contacts, policy: suppliedPolicy = {} } = {}) {
+  isEligible, isPaused = () => false, sendStatus, reply, contacts, policy: suppliedPolicy = {} } = {}) {
   if (!directory || !timeline?.availability || !timeline?.snapshot || typeof isEligible !== 'function'
     || typeof sendStatus !== 'function' || typeof reply !== 'function') throw Error('Missing life reply dependencies');
   if (contacts != null && typeof contacts.isCurrent !== 'function') throw Error('Invalid life contact coordinator');
@@ -178,9 +187,12 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
   catch (error) { if (error.code !== 'ENOENT') throw error; state = { version: VERSION, entries: [], seen: [] }; }
   let changed = false;
   for (const entry of state.entries) for (const key of ['statusAttempt', 'replyAttempt']) {
-    if (entry[key]?.state === 'claimed') {
-      entry[key].state = 'uncertain'; entry[key].reason = 'process-interrupted'; changed = true;
-      if (key === 'replyAttempt') { entry.doneAt = now(); entry.messages = []; delete entry.lifeContactEvidence; }
+    if (['claimed', 'sending'].includes(entry[key]?.state)) {
+      const retryable = key === 'replyAttempt' && entry[key].state === 'claimed' && entry[key].phase === 'generation';
+      entry[key].state = retryable ? 'failed' : 'uncertain'; entry[key].retryable = retryable;
+      entry[key].reason = 'process-interrupted'; changed = true;
+      if (key === 'replyAttempt' && !retryable) { entry.doneAt = now();
+        if (entry.sender.channel !== 'pwa') { entry.messages = []; delete entry.lifeContactEvidence; } }
     }
   }
   const beforeRecovery = JSON.stringify(state);
@@ -189,16 +201,28 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
   if (changed) await atomicWrite(path, state);
   let tail = Promise.resolve(), fault = null, closing = false, closingTask, draining;
   const operations = new Set();
+  const reservations = new Map();
+  const reservedScopes = () => new Set(reservations.values());
+  function canReceive(event) {
+    if (closing || fault || !isPrivate(event)) return false;
+    const scope = scopeFor(event), live = state.entries.filter(entry => !terminal(entry) && entry.expiresAt > stamp());
+    if (live.some(entry => entry.scope === scope && waiting(entry)) || reservedScopes().has(scope)) return true;
+    const occupied = live.length + [...reservedScopes()].filter(reserved => !live.some(entry => entry.scope === reserved && waiting(entry))).length;
+    return occupied < policy.maxEntries;
+  }
 
   function mutate(change) {
     const task = tail.then(async () => {
       if (fault) throw fault;
       const next = clone(state);
       const result = change(next);
-      if (JSON.stringify(next) !== JSON.stringify(state)) { await atomicWrite(path, next); state = next; }
+      if (JSON.stringify(next) !== JSON.stringify(state)) {
+        try { await atomicWrite(path, next); state = next; }
+        catch (error) { fault = error; throw error; }
+      }
       return result;
     });
-    tail = task.catch(error => { fault = error; });
+    tail = task.catch(() => {});
     return task;
   }
   function operation(work) {
@@ -217,18 +241,31 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
     let result, reason;
     try { result = await callback(); reason = result?.ok === true ? null : result?.ok === false && result?.uncertain !== true ? 'rejected' : 'unconfirmed'; }
     catch { reason = 'transport-or-callback-error'; }
-    const outcome = result?.ok === true ? 'sent' : result?.ok === false && result?.uncertain !== true ? 'failed' : 'uncertain';
+    const currentAttempt = state.entries.find(item => item.id === id)?.[key];
+    const safelyUnsent = result?.ok === false && result?.uncertain !== true
+      || result == null && key === 'replyAttempt' && currentAttempt?.state === 'claimed' && currentAttempt.phase === 'generation';
+    const outcome = result?.ok === true || result?.sentMessageIds?.length ? 'sent' : safelyUnsent ? 'failed' : 'uncertain';
     await mutate(next => {
       const entry = next.entries.find(item => item.id === id);
-      if (!entry || entry[key]?.state !== 'claimed') return;
+      if (!entry || !['claimed', 'sending'].includes(entry[key]?.state)) return;
       entry[key] = { ...entry[key], state: outcome, finishedAt: stamp(), ...(reason ? { reason } : {}) };
-      if (key === 'replyAttempt') { entry.doneAt = stamp(); entry.messages = []; delete entry.lifeContactEvidence; }
+      if (key === 'replyAttempt') {
+        const cancelled = ['memory-epoch-changed', 'contact-stopped', 'contact-stopped-or-stale', 'contact-epoch-superseded',
+          'incoming-already-consumed-or-stale', 'ineligible', 'new-input-accepted', 'pwa-route-or-input-changed'].includes(result?.reason);
+        entry[key].retryable = outcome === 'failed' && !cancelled;
+        if (entry[key].retryable) {
+          entry.nextAttemptAt = stamp() + Math.min(60000, 1000 * 2 ** Math.min(6, (entry[key].attempts || 1) - 1));
+        } else {
+          if (cancelled) entry.discarded = result.reason;
+          entry.doneAt = stamp(); entry.messages = []; delete entry.lifeContactEvidence;
+        }
+      }
     });
     return outcome;
   }
 
   async function receiveInner(event, { deferred = false } = {}) {
-    if (!isPrivate(event) || /^\s*\//.test(event.text || '') || !(await eligibility(event))) return { handled: false, kind: 'bypassed' };
+    if (!isPrivate(event) || event.backendCommand === true || !(await eligibility(event))) return { handled: false, kind: 'bypassed' };
     // Only a normal generation stopped before its first transport can be
     // deferred. A partly delivered answer or consumed catch-up is never replayed.
     if (deferred && (event.lifeReplyEpisodeId || event.lifeTransportStarted === true || event.sentMessageIds?.length)) {
@@ -247,16 +284,26 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
         withinBatch.add(message.id); return true;
       });
       if (!fresh.length) return { handled: true, kind: 'duplicate' };
-      let entry = next.entries.find(item => item.scope === scope && waiting(item));
-      const inFlight = next.entries.some(item => item.scope === scope && item.replyAttempt?.state === 'claimed'
+      let entry = next.entries.find(item => item.scope === scope && waiting(item)
+        && (item.sender.channel || 'qq') === (event.channel || 'qq')
+        && item.sender.privateIdentity?.routeVersion === event.privateIdentity?.routeVersion);
+      if (entry && JSON.stringify(entry.memoryEpochToken) !== JSON.stringify(event.memoryEpochToken)) {
+        entry.discarded = 'memory-epoch-changed'; entry.doneAt = at; entry.messages = []; delete entry.lifeContactEvidence; entry = null;
+      }
+      const hasInFlight = next.entries.some(item => item.scope === scope && inFlight(item)
         && current(item.lifeContactToken, scope));
       const mixedRetry = fresh.length !== messages.length;
-      if (!deferred && !available.busy && !entry && !inFlight && !mixedRetry) return { handled: false, kind: 'bypassed' };
+      if (!deferred && !available.busy && !entry && !hasInFlight && !mixedRetry) return { handled: false, kind: 'bypassed' };
       if (!entry) {
-        if (next.entries.length >= policy.maxEntries) throw Error('Life reply queue capacity exceeded');
+        compact(next, at, policy);
+        const reservedElsewhere = [...reservedScopes()].filter(reserved => reserved !== scope
+          && !next.entries.some(item => item.scope === reserved && waiting(item))).length;
+        if (next.entries.length + reservedElsewhere >= policy.maxEntries) return { handled: true, kind: 'capacity', retryable: true };
         entry = { id: randomUUID(), scope, sender: senderFor(event), createdAt: at, updatedAt: at,
           expiresAt: at + policy.maxAgeMs, messages: [], activities: [], statusAttempt: null, replyAttempt: null,
           ...(contacts ? { lifeContactToken: clone(event.lifeContactToken) } : {}),
+          ...(event.memoryEpochToken ? { memoryEpochToken: clone(event.memoryEpochToken) } : {}),
+          ...(event.lifeIncomingTokens ? { lifeIncomingTokens: [] } : {}),
           followup: !available.busy };
         next.entries.push(entry);
       }
@@ -272,6 +319,15 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
       while (entry.messages.length > 1 && entry.messages.map(message => message.text).join('\n').length > policy.maxTextChars) entry.messages.shift();
       if (entry.messages.length === 1) entry.messages[0].text = entry.messages[0].text.slice(0, policy.maxTextChars);
       entry.updatedAt = at;
+      entry.sender = senderFor(event);
+      if (entry.replyAttempt?.retryable) entry.nextAttemptAt = at;
+      if (Array.isArray(event.lifeIncomingTokens)) {
+        const combined = [...(entry.lifeIncomingTokens || []), ...event.lifeIncomingTokens];
+        const ids = new Set(); entry.lifeIncomingTokens = combined.filter(token => {
+          const key = JSON.stringify([token.scope, token.epoch, token.sequence]);
+          if (ids.has(key)) return false; ids.add(key); return true;
+        }).slice(-policy.maxSeen);
+      }
       if (contacts && event.lifeContactToken.sequence >= (entry.lifeContactToken?.sequence || 0)) {
         entry.lifeContactToken = clone(event.lifeContactToken);
         if (event.lifeContactEvidence) entry.lifeContactEvidence = clone(event.lifeContactEvidence);
@@ -286,7 +342,7 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
     });
     if (accepted.statusText != null) {
       await finishAttempt(accepted.episodeId, 'statusAttempt', () => current(event.lifeContactToken, scope)
-        ? sendStatus(event, accepted.statusText) : { ok: false });
+        ? sendStatus({ ...event, lifeReplyEpisodeId: accepted.episodeId, pwaStatusReply: true }, accepted.statusText) : { ok: false });
     }
     const { statusText: _statusText, ...result } = accepted;
     return result;
@@ -305,8 +361,12 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
       if ((await timeline.availability({ scope })).busy) continue;
       const pending = state.entries.find(entry => entry.scope === scope && waiting(entry));
       if (!pending || pending.statusAttempt?.state === 'claimed' || state.entries.some(entry => entry.scope === scope
-        && entry.replyAttempt?.state === 'claimed' && current(entry.lifeContactToken, scope))) continue;
+        && inFlight(entry) && current(entry.lifeContactToken, scope))) continue;
+      // An operational read-only pause is not a revoked relationship. Keep
+      // queued content until resumption instead of marking it ineligible.
+      if (await isPaused(mergedEvent(pending))) continue;
       const allowed = await eligibility(mergedEvent(pending));
+      if (allowed && pending.nextAttemptAt > stamp()) continue;
       const claimed = await mutate(next => {
         const entry = next.entries.find(item => item.id === pending.id);
         if (!entry || !waiting(entry)) return null;
@@ -315,19 +375,49 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
           entry.doneAt = stamp(); entry.messages = []; delete entry.lifeContactEvidence; totals.discarded++;
           return null;
         }
-        entry.replyAttempt = { state: 'claimed', at: stamp() };
+        entry.replyAttempt = { state: 'claimed', phase: 'generation', at: stamp(), attempts: (entry.replyAttempt?.attempts || 0) + 1 };
         return clone(entry);
       });
       if (!claimed) continue;
       totals.attempted++;
+      const details = { ...resumeDetails(claimed, timeline), markSending: () => mutate(next => {
+        const entry = next.entries.find(item => item.id === claimed.id);
+        if (!entry || entry.replyAttempt?.state !== 'claimed' || !current(entry.lifeContactToken, scope)) return false;
+        entry.replyAttempt.state = 'sending'; entry.replyAttempt.sendClaimedAt = stamp(); return true;
+      }) };
       const outcome = await finishAttempt(claimed.id, 'replyAttempt', () => current(claimed.lifeContactToken, scope)
-        ? reply(mergedEvent(claimed), resumeDetails(claimed, timeline)) : { ok: false });
+        ? reply(mergedEvent(claimed), details) : { ok: false, reason: 'contact-stopped' });
       if (outcome === 'sent') totals.sent++; else totals.failed++;
     }
     return totals;
   }
 
   return {
+    canReceive,
+    reconcilePwaDelivery({ episodeId, kind = 'reply', sentMessageIds }) {
+      return operation(() => mutate(next => {
+        if (!['reply','status'].includes(kind) || !Array.isArray(sentMessageIds) || !sentMessageIds.length) throw Error('Invalid PWA reply proof');
+        const entry = next.entries.find(item => item.id === episodeId), key = kind === 'reply' ? 'replyAttempt' : 'statusAttempt';
+        if (!entry || entry.sender.channel !== 'pwa') return { ok: true, skipped: true };
+        entry[key] = { ...entry[key], state: 'sent', at: entry[key]?.at || stamp(), finishedAt: stamp(), retryable: false, reason: 'pwa-mailbox-confirmed' };
+        if (kind === 'reply') { entry.doneAt = stamp(); entry.messages = []; delete entry.lifeContactEvidence; }
+        return { ok: true };
+      }));
+    },
+    recoverPwaDelivery(episodeId) {
+      return operation(() => mutate(next => {
+        const entry = next.entries.find(item => item.id === episodeId);
+        if (!entry || entry.sender.channel !== 'pwa' || !entry.messages.length || entry.replyAttempt?.state !== 'uncertain') return { ok: true, skipped: true };
+        entry.replyAttempt = { ...entry.replyAttempt, state: 'failed', retryable: true, reason: 'pwa-mailbox-absent' };
+        delete entry.doneAt; entry.nextAttemptAt = stamp(); return { ok: true };
+      }));
+    },
+    pwaRecoveryEntries() { return clone(state.entries.filter(e => e.sender.channel === 'pwa' && e.replyAttempt?.state === 'uncertain')); },
+    reserveIncoming(event) {
+      if (!canReceive(event)) return { ok: false, reason: 'life-reply-capacity' };
+      const id = randomUUID(); reservations.set(id, scopeFor(event)); return { ok: true, id };
+    },
+    releaseIncomingReservation(id) { return reservations.delete(id); },
     receive: event => operation(() => receiveInner(event)),
     // A reply generated before an activity transition may finish after that
     // activity has already ended. Preserve its original input and epoch even
@@ -342,6 +432,7 @@ export async function createLifeReplies({ directory, timeline, now = Date.now,
     close() {
       if (closingTask) return closingTask;
       closing = true;
+      reservations.clear();
       closingTask = (async () => {
         const results = await Promise.allSettled([...operations]);
         await tail;

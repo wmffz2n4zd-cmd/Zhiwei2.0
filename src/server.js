@@ -1,8 +1,24 @@
-import { isMac, userHome, resolveCodex, codexCommand, loadLocalConfig, localConfigPath, discoverSkills, resolveChatSkill, skillContext, validSignature, PrivateTasks } from './portable.js';
+import { enabledCreativeKinds, withCreativeSchema, creativeDecisionPrompt, readCreativeDecision, prepareCreativeWork } from './private-creative-work.js';
+import { creativeSpecGuidance, renderCreativeWork } from './creative-render.js';
+import { isMac, userHome, resolveCodex, codexCommand, loadLocalConfig, discoverSkills, resolveChatSkill, skillContext, PrivateTasks } from './portable.js';
 import { createServer } from "node:http";
 import { HubCommands, isHubCommand } from './hub-commands.js';
+import { isPrivateScope, privateEventScope, privateScopeId } from './private-scope.js';
+import { isPwaEvent, privateQueueKey, privateInboundIds, privateLogicalReplyId, pwaPayloadForInbox,
+  trustedPwaEvent, pwaIdentityCurrent, projectionEvent, pwaMessageId } from './private-transport.js';
+import { normalizePrivatePayload } from './private-events.js';
+import { buildStickerCatalog, formatStickerCatalog, buildImageSegment, formatImageSummary, resolveReplyMedia, stripImageAttachmentMarkers, buildChatStyleInstructions } from './shared-media.js';
+import { createPwaStore } from './pwa-store.js';
+import { createPwaAuth } from './pwa-auth.js';
+import { createPwaHttp } from './pwa-http.js';
+import { createPwaMedia } from './pwa-media.js';
+import { createPwaHistory } from './pwa-history.js';
+import { createPwaStickers } from './pwa-stickers.js';
+import { pwaHistoryInstruction, parsePwaHistoryRequest, pwaHistoryFingerprint, formatPwaHistoryEvidence, pwaHistorySourcesCurrent } from './pwa-chat-history.js';
+import { loadOrCreateVapidConfig, createPwaPushWorker } from './pwa-push.js';
 import { memoryScope } from './unified-memory/index.js';
-import { RecentImages } from './recent-images.js';
+import { queryTokens } from './unified-memory/recall.js';
+import { currentPwaImageInbox, restorePwaBusyInput, describePwaImageTurn, selectPwaImageTurn } from './pwa-image-turn.js';
 import { MoodState, stripMoodMarkers } from './mood-state.js';
 import { MessageBatches } from './message-batches.js';
 import { replyTimingContext, createReplyTiming, measureModelCall, measurePreparation, measureSend } from './reply-timing.js';
@@ -11,25 +27,46 @@ import { runCliProcess } from './cli-process.js';
 import { assertProxyReachable } from './proxy-control.js';
 import { createWorld, createWorldHttp } from './world.js';
 import { createWorldModel } from './world-model.js';
+import { buildRuntimeCapabilities, renderRuntimeCapabilities } from './runtime-capabilities.js';
 import { loadAssistantProfile } from './assistant-profile.js';
+import { privateReplySettings, resolveReplyWriter } from './private-reply-settings.js';
+import { loadPersonaRevision } from './persona-revision.js';
+import { createReplyEvidence, createPrivateChatEvidence, buildLayeredReplyPrompt, buildWriterPrompt, sharedReplyContract } from './private-reply-context.js';
+import { replyPlanSchema, parseReplyPlan, replyPlanPrompt, writerReplySchema, parseWriterReply, assembleReply, selectReplyVariant } from './private-reply-plan.js';
 import { createServiceLifecycle } from './service-lifecycle.js';
+import { writeJsonAtomic, readJsonRecoverableSync } from './atomic-file.js';
+import { createTransientFiles, pruneTransientFiles } from './transient-files.js';
 import { createLifeTimeline } from './life-timeline.js';
 import { createLifeReplies } from './life-replies.js';
 import { createLifeContacts, isExplicitContactStop, ownContactEvidence, isExplicitContactInvitation } from './life-contacts.js';
 import { createLifePlanner } from './life-planner.js';
 import { createLifeBrowsing } from './life-browsing.js';
-import { createLifeProactive, proactiveDecisionSchema, buildProactivePrompt } from './life-proactive.js';
-import { lifeChatDecisionSchema, parseLifeChatDecision, lifeChatDecisionPrompt } from './life-chat-decision.js';
+import { createPrivateThoughtActions } from './private-thought-actions.js';
+import { createSpacePublisher } from './space-publisher.js';
+import { createSpaceCommentReplies } from './space-comment-replies.js';
+import { createSpaceTimeline } from './space-timeline.js';
+import { createListedSpaceReader } from './space-sources.js';
+import { createLifeBrowseIntents, browseIntentDecisionSchema, buildLifeBrowseIntentPrompt } from './life-browse-intents.js';
+import { createLifeProactive, proactiveDecisionSchema, buildProactivePrompt,
+  proactiveRetrievalSchema, parseProactiveDecision, parseProactiveRetrieval, buildProactiveRetrievalPrompt } from './life-proactive.js';
+import { lifeChatDecisionSchema, parseLifeChatDecision, lifeChatDecisionPrompt,
+  chatReplyDecisionSchema, parseChatReplyDecision, chatReplyDecisionPrompt, withPrivateThoughtSchema } from './life-chat-decision.js';
+import { approvePublicTopics, createPublicTopicCatalog, createChatRetrieval, formatRetrievalEvidence } from './chat-retrieval.js';
+import { createPrivatePageRenderer } from './private-page-renderer.js';
+import { createChatLookupAdapter } from './chat-retrieval-http.js';
+import { createVideoReader, createVideoWorker, probeVideoDependencies, configuredVideoPlatforms, parseSharedVideoLinks, formatVideoEvidence } from './video-reader.js';
+import { createVideoSourceContext } from './video-source-context.js';
+import { withCurrentReplySignal } from './chat-reply-coordinator.js';
 import { createLifeConversation, conversationDecisionSchema, buildConversationPrompt } from './life-conversation.js';
 import { createLifeState } from './life-state.js';
 import { createLifeObserverHttp } from './life-observer-http.js';
 import { createConfiguredRuntimeBudget } from './runtime-budget-service.js';
+import { createPrivateLearning, learningDecisionSchema } from './private-learning.js';
+import { assertV201MemoryResetComplete } from './memory-reset-guard.js';
 import { ensureStickerLeadText, sendTextThenSticker, inReplyOrder } from './sticker-replies.js';
-const recentImages = new RecentImages();
-// Successful deliveries provide recipient provenance when a bridge omits
-// target_id on a later bot-authored quotation. Bound the in-process cache.
-const privateDeliveryRecipients = new Map();
 import { spawn } from "node:child_process";
+import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { access, mkdir, readFile, readdir, stat, writeFile, appendFile, rename } from "node:fs/promises";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -37,14 +74,43 @@ import { brotliDecompressSync } from "node:zlib";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const projectDir = join(__dirname, "..");
+// A partially applied maintenance reset must be resumed before any writer starts.
+await assertV201MemoryResetComplete({ dataDir: join(projectDir, 'data') });
 // Private chat is the product boundary; legacy configuration cannot re-enable groups.
-const localConfig = { ...loadLocalConfig(projectDir), qqPrivateOnly: true };
+const localConfig = loadLocalConfig(projectDir);
+const replySettings = privateReplySettings(localConfig);
+const personaPolicy = replySettings.personaRevision ? await loadPersonaRevision({ path: join(projectDir, 'data', 'persona-revision.json'), expectedRevision: replySettings.personaRevision }) : null;
+const servicePersonaToken = personaPolicy?.capture();
+const lifeGenerationValidity = new Map();
+const lifeGenerationSelections = new Map();
+const lifeGenerationRoutes = new Map();
+const personaCurrent = () => !personaPolicy || personaPolicy.isCurrent(servicePersonaToken);
 const runtimeBudget = await createConfiguredRuntimeBudget({ projectDir, config: localConfig });
 let serviceLifecycle = null;
+let pwaStore = null, pwaAuth = null, pwaHttp = null, pwaMedia = null, pwaPush = null, pwaHistory = null, pwaStickers = null;
+let pwaInboxSettledVersion = 0;
+let pwaTimer = null, pwaPumpRunning = false, pwaProjectionRunning = false;
+const pwaActiveInbox = new Set(), pwaActiveLogical = new Set();
+const pwaConfig = localConfig.pwa || {};
+const pwaWritable = () => pwaConfig.enabled === true && pwaConfig.readOnly !== true;
 let lifeTimeline = null, lifeReplies = null, lifeContacts = null, lifePlanner = null, personalLifeState = null, lifeTimer = null;
+let lifeFailure = null, lifeFailureRetryable = false, contactFailure = null;
+const lifeAvailable = () => Boolean(lifeTimeline && !lifeFailure);
+function suspendLife(error, { retryable = false } = {}) {
+  if (!lifeFailure) console.error('Life subsystem unavailable; private contact boundaries remain active:', error?.message || 'unknown failure');
+  lifeFailureRetryable = lifeFailure ? lifeFailureRetryable && retryable : retryable;
+  lifeFailure = error || Error('Life subsystem unavailable');
+}
 let lifeBrowsing = null, lifeProactive = null, lifeActionsPending = false;
+let privateThoughtActions = null, privateThoughtTickPending = false;
+let spaceTimeline = null, spaceTickPending = false;
+let spaceCommentReplies = null, spaceCommentTickPending = false;
+let lifeBrowseIntents = null, lifeBrowseFailure = false, lifePlanningWork = null, lifeProactivePending = false;
+const browseIntentsEnabled = localConfig.life?.enabled === true && localConfig.life?.planning?.enabled === true
+  && localConfig.life?.browsingIntents?.enabled !== false;
+const browseIntentsAvailable = () => Boolean(lifeAvailable() && lifeBrowseIntents && !lifeBrowseIntents.diagnostics().failed);
 let lifeConversation = null, lifeConversationPending = false;
-let lifeTickPending = false, lifeDrainPending = false, lifePlanningPending = false;
+let lifeTickPending = false, lifeDrainPending = false, lifePlanningPending = false, lifeExperiencePending = false, temporaryFilesTimer = null;
 const lifeWarningsSeen = new Set();
 let activeHttpRequests = 0, activeBackgroundTasks = 0, activeCliProcesses = 0;
 let persistenceFailed = false;
@@ -53,20 +119,52 @@ function backgroundTask(task) {
   return Promise.resolve(task).finally(() => { activeBackgroundTasks--; });
 }
 const installedSkills = discoverSkills(projectDir, localConfig);
-const oneBotSecret = process.env.ONEBOT_SECRET || localConfig.oneBotSecret || '';
-const oneBotToken = process.env.ONEBOT_ACCESS_TOKEN || localConfig.oneBotAccessToken || '';
 const privateTasks = new PrivateTasks({
   skills: installedSkills,
   allowFullAccess: localConfig.allowFullAccessTasks === true,
-  enabled: Boolean(localConfig.remoteEnabled && oneBotSecret && localConfig.ownerUserIds?.length),
+  enabled: Boolean(localConfig.remoteEnabled && localConfig.pwa?.enabled),
   run: runPrivateTask
 });
 const publicDir = join(projectDir, "modules", "web-console", "public");
-const codexWorkspaceDir = join(projectDir, "workspaces", "codex-cli");
+const codexWorkspaceDir = join(projectDir, 'runtime', 'chat-workspace');
 const codexTmpDir = join(projectDir, "runtime", "replies");
+let world = null;
+const chatLookupAdapter = createChatLookupAdapter({
+  renderPage: createPrivatePageRenderer(localConfig.world || {}),
+  searchPublicNotes: (query, options) => world ? world.searchPublicNotes(query, options) : { status: 'failed', sources: [] }
+});
+const publicTopicCatalog = createPublicTopicCatalog();
+const chatRetrieval = createChatRetrieval({ cacheDir: join(projectDir, 'runtime', 'chat-evidence'), adapter: chatLookupAdapter });
+const videoPlatforms = configuredVideoPlatforms(localConfig.video?.platforms);
+const videoSources = createVideoSourceContext({ platforms: videoPlatforms });
+const videoTurnFacts = new WeakMap();
+let videoReader = null;
+if (localConfig.video?.enabled === true) {
+  try {
+    if (!videoPlatforms.length) throw Error('No enabled video platforms');
+    const workerPath = join(projectDir, 'scripts', 'video-worker.py');
+    const workerOptions = {
+      platforms: videoPlatforms, workerPath, dependencyRoot: localConfig.video.dependencyRoot, pythonPath: localConfig.video.pythonPath || '/usr/bin/python3',
+      nodePath: localConfig.video.nodePath || process.execPath, sessionBrowser: localConfig.video.sessionBrowser
+    };
+    const probe = await probeVideoDependencies({ ...workerOptions, directory: join(projectDir, 'tmp', 'video-probe') });
+    if (probe.ready !== true) throw Error('Video dependencies unavailable');
+    videoReader = createVideoReader({ directory: join(projectDir, 'tmp', 'video-evidence'), platforms: videoPlatforms,
+      worker: createVideoWorker(workerOptions) });
+  } catch { console.error('Optional video evidence unavailable; private text chat remains available'); }
+}
 const imessageScreenshotsDir = join(projectDir, "runtime", "imessage-screenshots");
-const qqStickerDir = process.env.CODEX_REMOTE_CONTACT_QQ_STICKER_DIR || join(projectDir, "data", "qq-stickers");
+const stickerDir = process.env.CODEX_REMOTE_CONTACT_STICKER_DIR || process.env.CODEX_REMOTE_CONTACT_QQ_STICKER_DIR || join(projectDir, "data", "qq-stickers");
 const dataDir = join(projectDir, "data");
+if (pwaConfig.enabled === true) {
+  if (!/^https:\/\//.test(pwaConfig.origin || '')) throw Error('PWA requires an explicit HTTPS origin');
+  const directory = pwaConfig.dataDirectory || join(dataDir, 'pwa');
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  pwaStore = createPwaStore({ path: pwaConfig.databasePath || join(directory, 'pwa.sqlite') });
+  pwaAuth = createPwaAuth({ store: pwaStore });
+  pwaMedia = await createPwaMedia({ directory: join(directory, 'media'), store: pwaStore,
+    allowedOutboundRoots: [stickerDir] });
+}
 const codexHomeDir = process.env.CODEX_HOME || join(userHome, ".codex");
 const codexSessionsDir = join(codexHomeDir, "sessions");
 const codexArchivedSessionsDir = join(codexHomeDir, "archived_sessions");
@@ -116,17 +214,7 @@ let parseUnifiedMemoryJudge = () => ({ action: "none", reason: "unified-memory m
 let formatRecentContextPrompt = () => "";
 let searchRecentCodexContext = async () => [];
 
-let buildQqChatStyleInstructions = () => "";
-let buildQqReplyWorkspaceStyleInstructions = () => [];
-let buildQqStickerCatalog = async () => [];
-let buildQqImageSegment = (filePath) => ({ type: "image", data: { file: `file://${filePath}` } });
-let extractOneBotImageInputs = () => [];
-let formatQqImageSummary = () => "";
-let formatQqStickerCatalog = () => "";
-let prepareQqModelImages = async () => [];
-let qqVisionAvailable = false;
-let resolveQqReplyMedia = async () => [];
-let stripQqImageAttachmentMarkers = (text) => String(text || "").trim();
+const privateVisionAvailable = true;
 
 async function importOptionalModule(label, candidates) {
   for (const candidate of candidates.filter(Boolean)) {
@@ -169,39 +257,20 @@ if (recentContextModule) {
   searchRecentCodexContext = recentContextModule.searchRecentCodexContext || searchRecentCodexContext;
 }
 
-const qqEnhancerModule = await importOptionalModule("qq-enhancer", [
-  process.env.CODEX_REMOTE_CONTACT_QQ_ENHANCER_MODULE,
-  new URL("./qq-enhancer/index.js", import.meta.url).href,
-  pathToFileURL(join(projectDir, "modules", "qq-enhancer", "index.js")).href,
-  pathToFileURL(join(projectDir, "..", "qq-enhancer", "src", "qq-enhancer", "index.js")).href
-]);
-if (qqEnhancerModule) {
-  buildQqChatStyleInstructions = qqEnhancerModule.buildQqChatStyleInstructions || buildQqChatStyleInstructions;
-  buildQqReplyWorkspaceStyleInstructions = qqEnhancerModule.buildQqReplyWorkspaceStyleInstructions || buildQqReplyWorkspaceStyleInstructions;
-  buildQqStickerCatalog = qqEnhancerModule.buildQqStickerCatalog || buildQqStickerCatalog;
-  buildQqImageSegment = qqEnhancerModule.buildQqImageSegment || buildQqImageSegment;
-  extractOneBotImageInputs = qqEnhancerModule.extractOneBotImageInputs || extractOneBotImageInputs;
-  formatQqImageSummary = qqEnhancerModule.formatQqImageSummary || formatQqImageSummary;
-  formatQqStickerCatalog = qqEnhancerModule.formatQqStickerCatalog || formatQqStickerCatalog;
-  prepareQqModelImages = qqEnhancerModule.prepareQqModelImages || prepareQqModelImages;
-  qqVisionAvailable = Boolean(qqEnhancerModule.extractOneBotImageInputs && qqEnhancerModule.prepareQqModelImages);
-  resolveQqReplyMedia = qqEnhancerModule.resolveQqReplyMedia || resolveQqReplyMedia;
-  stripQqImageAttachmentMarkers = qqEnhancerModule.stripQqImageAttachmentMarkers || stripQqImageAttachmentMarkers;
-}
-
-const oneBotApiBase = process.env.ONEBOT_API_BASE || localConfig.oneBotApiBase || "http://127.0.0.1:3000";
 const codexCliPath = resolveCodex();
 const codexModel = process.env.CODEX_REMOTE_CONTACT_CODEX_MODEL || localConfig.chatModel || (isMac ? "gpt-5.4-mini" : "default");
 const codexReasoningEffort = process.env.CODEX_REMOTE_CONTACT_REASONING_EFFORT || "low";
 const imessageCodexModel = process.env.CODEX_REMOTE_CONTACT_IMESSAGE_CODEX_MODEL || "gpt-5.4";
 const imessageCodexReasoningEffort = process.env.CODEX_REMOTE_CONTACT_IMESSAGE_REASONING_EFFORT || "medium";
-const qqEnhancerEnabled = process.env.CODEX_REMOTE_CONTACT_QQ_ENHANCER !== "0";
+const mediaEnabled = process.env.CODEX_REMOTE_CONTACT_MEDIA !== "0";
 const imessageMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_IMESSAGE_MEMORY_LIMIT || 120);
 const remoteExecutionMemoryLimit = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_MEMORY_LIMIT || 160);
 const remoteExecutionIdleTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_REMOTE_EXECUTION_IDLE_TTL_MS || 15 * 60 * 1000);
-const qqWebLookupEnabled = process.env.CODEX_REMOTE_CONTACT_QQ_WEB_LOOKUP != null ? process.env.CODEX_REMOTE_CONTACT_QQ_WEB_LOOKUP !== "0" : localConfig.webLookup !== false;
-const qqWebLookupTimeoutMs = Number(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_TIMEOUT_MS || 12000);
-const qqWebSearchProvider = String(process.env.CODEX_REMOTE_CONTACT_QQ_WEB_PROVIDER || "auto").trim().toLowerCase();
+const webLookupEnabled = process.env.CODEX_REMOTE_CONTACT_WEB_LOOKUP != null ? process.env.CODEX_REMOTE_CONTACT_WEB_LOOKUP !== "0" : localConfig.webLookup !== false;
+const webSearchProvider = 'xiaohongshu';
+// One bounded startup warm contains only application-owned public feed URLs.
+// Ordinary replies read the resulting catalogue without waiting on HTTP.
+if (webLookupEnabled) void backgroundTask(publicTopicCatalog.getTopics({})).catch(() => {});
 const proxyShortcutName = process.env.CODEX_REMOTE_CONTACT_PROXY_TOGGLE_SHORTCUT || "切换VPN";
 const proxyConfirmTtlMs = Number(process.env.CODEX_REMOTE_CONTACT_PROXY_CONFIRM_TTL_MS || 3 * 60 * 1000);
 const imessageAttachmentSendingEnabled = process.env.CODEX_REMOTE_CONTACT_IMESSAGE_ATTACHMENTS === "1";
@@ -215,11 +284,27 @@ let assistantMentionAliases = (process.env.CODEX_REMOTE_CONTACT_ASSISTANT_MENTIO
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);
-const unifiedMemory = createUnifiedMemory({ memoryPath: unifiedMemoryPath });
+const unifiedMemory = createUnifiedMemory({ memoryPath: unifiedMemoryPath, personaPolicy });
+unifiedMemory.subscribeLearningInvalidation(event => chatRetrieval.invalidateScope(event.scope));
+unifiedMemory.subscribeLearningInvalidation(event => event.scope === 'all' ? videoReader?.invalidateAll() : videoReader?.invalidate(event.scope));
+unifiedMemory.subscribeLearningInvalidation(event => videoSources.invalidate(event.scope));
+unifiedMemory.subscribeLearningInvalidation(event => privateThoughtActions?.invalidate(event.scope));
+// Establish the durable initialized boundary before accepting any work. A lost
+// existing store must never become a successful first-run empty conversation.
+await unifiedMemory.ensureInitialized();
 const moodState = new MoodState({ memory: unifiedMemory, enabled: localConfig.mood?.enabled === true });
+let privateLearning = null;
+try {
+  privateLearning = await createPrivateLearning({ directory: join(dataDir, 'private-learning'),
+    memory: unifiedMemory, personaPolicy, config: localConfig.privateLearning || {}, runModel: runPrivateLearningModel,
+    onError: () => console.error('Optional private learning is unavailable; continuing without learned context') });
+} catch {
+  console.error('Optional private learning could not initialize; continuing ordinary chat');
+}
 
 const state = {
   ai: {
+    privateReply: replySettings,
     provider: "codex-cli",
     model: codexModel || "default",
     reasoningEffort: codexReasoningEffort,
@@ -228,17 +313,15 @@ const state = {
     workspace: codexWorkspaceDir
   },
   channels: {
-    qq: Boolean(localConfig.qqEnabled),
+    pwa: pwaConfig.enabled === true,
     imessage: isMac
   },
-  qq: {
-    ownerUserIds: [],
-    bannedUserIds: [],
+  privateChat: {
     enhancer: {
-      enabled: qqEnhancerEnabled
+      enabled: mediaEnabled
     },
     webLookup: {
-      enabled: qqWebLookupEnabled
+      enabled: webLookupEnabled
     },
     events: []
   },
@@ -281,13 +364,6 @@ const state = {
   },
   maintenance: {
     startedAt: new Date().toISOString(),
-    oneBot: {
-      ok: false,
-      lastCheckedAt: null,
-      lastError: null,
-      selfId: null,
-      nickname: null
-    },
     codex: {
       path: codexCliPath,
       lastRunAt: null,
@@ -297,7 +373,7 @@ const state = {
       quota: null
     },
     webLookup: {
-      enabled: qqWebLookupEnabled,
+      enabled: webLookupEnabled,
       effectiveProvider: null,
       lastQuery: null,
       lastRunAt: null,
@@ -308,7 +384,7 @@ const state = {
   }
 };
 
-const seenOneBotMessageIds = new Map();
+const seenPrivateMessageIds = new Map();
 const seenMessageTtlMs = 10 * 60 * 1000;
 let imessagePollTimer = null;
 let remoteExecutionIdleTimer = null;
@@ -351,26 +427,20 @@ async function readBody(req) {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 1024 * 1024) throw new Error('Request exceeds 1 MiB');
+    if (size > 1024 * 1024) throw Object.assign(new Error('Request exceeds 1 MiB'), { statusCode: 413 });
     chunks.push(chunk);
   }
   if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw Object.assign(new Error('Invalid JSON request'), { statusCode: 400 }); }
 }
 
 async function loadSettings() {
   await mkdir(dataDir, { recursive: true });
   try {
-    const body = JSON.parse(await readFile(settingsPath, "utf8"));
-    if (Array.isArray(body.qq?.ownerUserIds)) {
-      state.qq.ownerUserIds = normalizeList(body.qq.ownerUserIds);
-    }
-    if (Array.isArray(body.qq?.bannedUserIds)) {
-      state.qq.bannedUserIds = normalizeList(body.qq.bannedUserIds);
-    }
-    if (body.qq?.enhancer && typeof body.qq.enhancer === "object") {
-      state.qq.enhancer.enabled = body.qq.enhancer.enabled !== false;
-    }
+    const body = readJsonRecoverableSync(settingsPath, { warn: message => console.warn(message) });
+    const mediaSettings = body.privateChat?.enhancer ?? body.qq?.enhancer;
+    if (mediaSettings && typeof mediaSettings === 'object') state.privateChat.enhancer.enabled = mediaSettings.enabled !== false;
     if (Array.isArray(body.imessage?.trustedHandles)) {
       state.imessage.trustedHandles = normalizeList(body.imessage.trustedHandles);
     }
@@ -426,16 +496,17 @@ async function loadSettings() {
     }
   } catch (error) {
     if (error.code !== "ENOENT") {
-      console.warn(`Unable to load settings: ${error.message}`);
+      throw new Error('Unable to load settings safely', { cause: error });
     }
   }
 }
 
 async function saveSettings() {
   await mkdir(dataDir, { recursive: true });
-  await writeFile(
+  await writeJsonAtomic(
     settingsPath,
-    JSON.stringify({
+    {
+      ...readJsonRecoverableSync(settingsPath, { missing: {}, warn: message => console.warn(message) }),
       version: 1,
       updatedAt: new Date().toISOString(),
       ai: {
@@ -444,13 +515,7 @@ async function saveSettings() {
         imessageModel: state.ai.imessageModel,
         imessageReasoningEffort: state.ai.imessageReasoningEffort
       },
-      qq: {
-        ownerUserIds: state.qq.ownerUserIds,
-        bannedUserIds: state.qq.bannedUserIds,
-        enhancer: {
-          enabled: state.qq.enhancer.enabled
-        }
-      },
+      privateChat: { enhancer: { enabled: state.privateChat.enhancer.enabled } },
       imessage: {
         trustedHandles: state.imessage.trustedHandles,
         replyHandle: state.imessage.replyHandle
@@ -471,7 +536,7 @@ async function saveSettings() {
         userAgent: userAgentName,
         assistantMentions: assistantMentionAliases
       }
-    }, null, 2)
+    }, { previous: true }
   );
 }
 
@@ -563,6 +628,7 @@ async function saveRemoteExecutionMemory() {
 function buildPublicState() {
   return {
     ...state,
+    ai: { ...state.ai, privateReply: { ...replySettings, ordinaryWriter: resolveReplyWriter(replySettings, { model: localConfig.privateChatModel || state.ai.model, reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort }), lifeWriter: resolveReplyWriter(replySettings, { model: localConfig.privateChatModel || localConfig.world?.model || state.ai.model, reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort }) } },
     imessage: {
       trustedHandles: state.imessage.trustedHandles,
       replyHandle: state.imessage.replyHandle,
@@ -626,23 +692,25 @@ function normalizeMemoryEntries(entries, limit) {
 async function buildMaintenanceStatus() {
   const codexPathOk = await access(codexCliPath).then(() => true).catch(() => false);
   const quota = await getCachedCodexQuotaSnapshot();
-  await checkOneBotHealth();
   return {
     ...state.maintenance,
+    webLookup: { ...state.maintenance.webLookup, effectiveProvider: webSearchProvider,
+      retrieval: chatRetrieval.getStatus(), publicCatalog: publicTopicCatalog.getStatus() },
+    video: { enabled: Boolean(videoReader), ...(videoReader?.getStatus() || {}) },
+    privateReply: buildPublicState().ai.privateReply,
     codex: {
       ...state.maintenance.codex,
       pathExists: codexPathOk,
       quota
     },
     channels: {
-      qq: state.channels.qq,
+      pwa: state.channels.pwa,
       imessage: state.channels.imessage
     },
-    qq: {
-      bannedUsers: state.qq.bannedUserIds.length,
-      recentEvents: state.qq.events.length,
-      webLookupEnabled: state.qq.webLookup.enabled,
-      webLookupProvider: state.maintenance.webLookup.effectiveProvider || qqWebSearchProvider
+    privateChat: {
+      recentEvents: state.privateChat.events.length,
+      webLookupEnabled: state.privateChat.webLookup.enabled,
+      webLookupProvider: state.maintenance.webLookup.effectiveProvider || webSearchProvider
     },
     imessage: {
       status: state.imessage.status,
@@ -1144,59 +1212,10 @@ function normalizeRateLimitWindow(window) {
   };
 }
 
-function oneBotFetch(url, options = {}) {
-  if (localConfig.qqPrivateOnly === true) {
-    const action = new URL(url).pathname.replace(/\/$/, '').split('/').at(-1);
-    if (['send_group_msg', 'send_group_forward_msg', 'set_group_add_request'].includes(action)) {
-      throw Error('Private-only mode blocks group messages and group invitations');
-    }
-    if (action === 'send_msg') {
-      const body = JSON.parse(options.body || '{}');
-      if (body.message_type === 'group' || body.group_id != null) throw Error('Private-only mode blocks group messages');
-    }
-  }
-  return fetch(url, { ...options, signal: options.signal || AbortSignal.timeout(15000),
-    headers: { ...options.headers, ...(oneBotToken ? { Authorization: 'Bearer ' + oneBotToken } : {}) }
-  });
-}
-async function checkOneBotHealth() {
-  const checkedAt = new Date().toISOString();
-  try {
-    const response = await oneBotFetch(`${oneBotApiBase}/get_login_info`, { signal: AbortSignal.timeout(2500) });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || (body.status != null && body.status !== "ok")) {
-      throw new Error(`HTTP ${response.status}: ${JSON.stringify(body).slice(0, 240)}`);
-    }
-    state.maintenance.oneBot = {
-      ok: true,
-      lastCheckedAt: checkedAt,
-      lastError: null,
-      selfId: body.data?.user_id == null ? null : String(body.data.user_id),
-      nickname: body.data?.nickname || null
-    };
-  } catch (error) {
-    state.maintenance.oneBot = {
-      ...state.maintenance.oneBot,
-      ok: false,
-      lastCheckedAt: checkedAt,
-      lastError: error.message
-    };
-  }
-}
 
-async function fetchOneBotImage(file) {
-  const response = await oneBotFetch(`${oneBotApiBase}/get_image`, {
-    signal: AbortSignal.timeout(15000),
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ file: String(file || ""), download: true })
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || (body.status != null && body.status !== "ok")) {
-    throw new Error(`Unable to fetch QQ image ${file}`);
-  }
-  return body.data || body;
-}
+
+
+
 
 function stripMentionText(text) {
   let value = String(text || "")
@@ -1211,11 +1230,11 @@ function stripMentionText(text) {
   return value.trim();
 }
 
-function formatQqIncomingPromptText(event, text) {
+function formatPrivateIncomingPromptText(event, text) {
   if (text) return text;
   if (event.images?.length) return "对方发送了图片或表情，没有附文字。";
   if (Array.isArray(event.raw?.message) && event.raw.message.some(segment => ["face", "mface"].includes(segment?.type))) {
-    return "对方发送了QQ表情，没有附文字。";
+    return "对方发送了表情，没有附文字。";
   }
   if (event.hasReplySegment) return "对方引用了前面的消息，没有附文字。";
   if (event.hasSelfAtSegment) return "对方只 @ 了你，没有附加具体内容。";
@@ -1226,7 +1245,7 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function normalizeQqDisplayText(text) {
+function normalizePrivateDisplayText(text) {
   return String(text || "")
     .replace(/\[CQ:image,[^\]]+\]/g, "[图片]")
     .replace(/\[CQ:(?:record|voice|audio),[^\]]+\]/g, "[语音]")
@@ -1237,127 +1256,44 @@ function normalizeQqDisplayText(text) {
     .trim();
 }
 
-function shouldRespondToQq(event) {
-  if (!isPrivateMemoryEvent(event)) return { ok: false, reason: 'Private chat requires a valid participant' };
-  if (event.isOwner && isHubCommand(event.text)) return { ok: true, reason: 'Owner backend command' };
-  const privateTest = hubCommands.testDecision(event);
-  if (privateTest) return privateTest;
-  if (!state.channels.qq) return { ok: false, reason: 'QQ channel is off' };
-  if (isBannedQqSender(event)) return { ok: false, reason: 'Sender is banned' };
-  if (hasUnhandledQqAudio(event)) return { ok: false, reason: 'Voice message ignored until transcription is available' };
-  const allowed = localConfig.allowOtherPrivateChats === true || isMac || event.isOwner;
-  return { ok: allowed, reason: allowed ? 'Private chat allowed' : 'Private chat requires an owner' };
+function shouldRespondToPrivate(event) {
+  return { ok: isPrivateMemoryEvent(event) && pwaIdentityCurrent(event, pwaStore) && pwaWritable(), reason: 'Invitation private chat' };
 }
 
-function hasUnhandledQqAudio(event) {
-  return Boolean(event.hasAudioSegment)
-    || /\[CQ:(?:record|voice|audio),/i.test(String(event.text || ""))
-    || /\[CQ:(?:record|voice|audio),/i.test(String(event.replyContext?.text || ""));
-}
 
-function isBannedQqSender(event) {
-  return event.senderId != null && state.qq.bannedUserIds.includes(String(event.senderId));
-}
 
-function getSenderLabel(senderId, senderName) {
-  if (state.qq.ownerUserIds.includes(String(senderId))) return ownerLabel;
-  return senderName || "对方";
-}
+
+
+
 
 function buildAssistantReply(event) {
   const text = stripMentionText(event.text);
   const topic = text || "刚刚叫我但是没有给题目";
   const address = event.isOwner ? `${ownerLabel}，` : "";
 
-  return `${pickActionBeat(event)}收到，${address}我看到啦：${topic}`;
+  return `收到，${address}我看到啦：${topic}`;
 }
 
 function buildBoundaryReply(event) {
   const text = stripMentionText(event.text);
   if (isFilesystemProbe(text)) {
-    return `${pickActionBeat(event)}这涉及本机文件和后台信息，普通聊天里不会读取或公开这些内容。`;
-  }
-  if (isPlayFightRequest(text)) {
-    if (event.isOwner) {
-      return `${pickActionBeat(event)}收到${ownerLabel}，这就用零现实伤害的玩笑语气回一下。`;
-    }
-    return `${pickActionBeat(event)}这个不行哦，打人任务不接单。`;
+    return `这涉及本机文件和后台信息，普通聊天里不会读取或公开这些内容。`;
   }
   return null;
 }
 
-function buildQqCommandAction(event) {
-  const command = stripMentionText(event.text).trim();
-  if (!command.startsWith("/")) return null;
-  const normalized = command.replace(/^\/+/, "").trim();
-  const compact = normalized.replace(/\s+/g, "").toLowerCase();
-
-  if (!event.isOwner) {
-    if (/^(ban|unban|关闭qq|关掉qq|停止qq|切断qq)/i.test(compact)) {
-      return {
-        reply: `${pickActionBeat(event)}这个是管理指令，只听${ownerLabel}的哦。`
-      };
-    }
-    return null;
-  }
-
-  if (/^(冒泡模式|活跃模式)$/.test(compact)) {
-    return { reply: '群聊发言模式已停用，知微仅使用私聊。' };
-  }
-
-  if (/^(关闭qq|关掉qq|停止qq|切断qq|qq关闭|qq关掉)$/i.test(compact)) {
-    return {
-      reply: `${pickActionBeat(event)}收到，QQ 私聊响应现在关闭。发送 /开启QQ 可恢复，管理员指令仍可使用。`,
-      afterSend: async () => {
-        state.channels.qq = false;
-      }
-    };
-  }
-
-  if (/^(ban|封禁|拉黑)/i.test(normalized)) {
-    const targetId = extractQqCommandTarget(event, normalized);
-    if (!targetId) {
-      return { reply: `${pickActionBeat(event)}要封禁谁呀？可以用 /ban @对方 或 /ban QQ号。` };
-    }
-    if (state.qq.ownerUserIds.includes(targetId)) {
-      return { reply: `${pickActionBeat(event)}${ownerLabel}不能被 ban，权限核心不能拔掉。` };
-    }
-    if (event.selfId && targetId === String(event.selfId)) {
-      return { reply: `${pickActionBeat(event)}不能把我自己 ban 掉啦，不然这个接口会当场打结。` };
-    }
-    state.qq.bannedUserIds = normalizeList([...state.qq.bannedUserIds, targetId]);
-    return {
-      reply: `${pickActionBeat(event)}已加入 ban 名单：${targetId}。之后这个 QQ 号的 @ 或回复不会被受理。`,
-      afterSend: saveSettings
-    };
-  }
-
-  if (/^(unban|解禁|解除封禁|取消拉黑)/i.test(normalized)) {
-    const targetId = extractQqCommandTarget(event, normalized);
-    if (!targetId) {
-      return { reply: `${pickActionBeat(event)}要解禁谁呀？可以用 /unban @对方 或 /unban QQ号。` };
-    }
-    state.qq.bannedUserIds = state.qq.bannedUserIds.filter((id) => id !== targetId);
-    return {
-      reply: `${pickActionBeat(event)}已解禁：${targetId}。`,
-      afterSend: saveSettings
-    };
-  }
-
-  if (/^(banlist|封禁列表|ban列表)$/i.test(compact)) {
-    const list = state.qq.bannedUserIds.length ? state.qq.bannedUserIds.join("\n") : "暂无 ban 用户。";
-    return { reply: `当前 QQ ban 名单：\n${list}` };
-  }
-
+function buildPrivateCommandAction(event) {
+  const command = String(event.text || '').trim();
+  if (!command.startsWith('/') || !event.isOwner) return null;
   const modelMatch = command.match(/^\/?模型\s+(.+)$/i);
   if (modelMatch) {
     const model = modelMatch[1].trim();
     if (!/^[A-Za-z0-9._:-]+$/.test(model)) {
-      return { reply: `${pickActionBeat(event)}这个模型名看起来不太对，我这边只接受字母、数字、点、横线、下划线和冒号。` };
+      return { reply: `这个模型名看起来不太对，我这边只接受字母、数字、点、横线、下划线和冒号。` };
     }
     state.ai.model = model;
     return {
-      reply: `${pickActionBeat(event)}QQ 通道模型已切换：${model}`,
+      reply: `私聊模型已切换：${model}`,
       afterSend: saveSettings
     };
   }
@@ -1367,7 +1303,7 @@ function buildQqCommandAction(event) {
     const effort = normalizeReasoningEffort(effortMatch[1]);
     state.ai.reasoningEffort = effort;
     return {
-      reply: `${pickActionBeat(event)}QQ 通道智能等级已切换：${effort}`,
+      reply: `私聊智能等级已切换：${effort}`,
       afterSend: saveSettings
     };
   }
@@ -1375,16 +1311,15 @@ function buildQqCommandAction(event) {
   return null;
 }
 
-function extractQqCommandTarget(event, command) {
-  const selfId = event.selfId == null ? "" : String(event.selfId);
-  const atTarget = (event.atTargets || []).map(String).find((id) => id && id !== selfId);
-  if (atTarget) return atTarget;
-  const text = String(command || "");
-  const cqAt = text.match(/\[CQ:at,qq=(\d+)\]/);
-  if (cqAt) return cqAt[1];
-  const plainId = text.match(/\b([1-9][0-9]{4,12})\b/);
-  return plainId?.[1] || "";
+// Classification is pure: command handlers can mutate settings and must never
+// be called just to decide whether a message needs ordinary-chat safeguards.
+function isBackendPrivateCommand(event) {
+  const text = String(event.text || '').trim();
+  return isHubCommand(text) || /^\/(执行|执行完全访问|远程执行|确认|取消|技能|帮助|清空任务记忆)(?:\s|$)/.test(text)
+    || /^\/模型\s+/.test(text) || /^\/(?:智能等级|智能|思考强度)\s+/.test(text);
 }
+
+
 
 function isFilesystemProbe(text) {
   const normalized = String(text || "").toLowerCase();
@@ -1393,124 +1328,30 @@ function isFilesystemProbe(text) {
   return sensitiveTarget.test(normalized) && probeVerb.test(normalized);
 }
 
-function isPlayFightRequest(text) {
-  const normalized = String(text || "");
-  return /(揍|打|锤|扁|收拾|暴打|打一顿)/.test(normalized) && /@|他|她|它|这个|那个人|群友/.test(normalized);
-}
-
 async function buildAssistantInstructions(event) {
   const speaker = event.isOwner ? ownerLabel : event.senderLabel || '对方';
-  const actionExamples = buildActionExamples(event);
-  const assistantSkillBrief = await loadAssistantSkillBrief();
+  const channelName = '知微手机 PWA';
   return [
-    '你正在为 QQ 私聊生成本轮将由知微账号发出的回复。',
+    `你正在为 ${channelName} 私聊生成本轮将由知微账号发出的回复。`,
     '只输出最终要发送出去的中文文本，不要解释，不要写前后缀，不要使用 Markdown。',
-    '你是接入 QQ 的 ' + assistantName + '。自称“我”，自然地与当前对象聊天。',
+    '你是接入' + channelName + '的 ' + assistantName + '。自称“我”，自然地与当前对象聊天。',
     '当前说话者：' + speaker + '。管理员使用普通语气时同样是日常聊天；只有显式斜杠命令进入管理交互，不主动展示指令菜单或测试提示。',
-    '回复通常1到4句，长度随内容自然调整；不在结尾追加“想的话我还能”“如果需要我可以”等服务式结束语。',
-    '适合自然分开发送的接话、补充或念头，用空行分成完整语义段，系统会依次发送；单换行仍在同一条内。短答或不宜拆开的内容保持一段，不按每个标点拆分、不凑段数、不因分段扩写。若本次另有只发一条的要求，以该要求为准。',
-    state.qq.enhancer.enabled ? buildQqChatStyleInstructions(event) : '语气自然、简短，不刻意表演。',
-    '可以有少量括号动作，也可以不写；不要每次开头都写动作，不绑定固定句式。具体外观和性格以人格设定为准。',
-    '本次可参考的动作素材：' + actionExamples + '。',
-    '不要机械复读对方的QQ昵称。不要透露本机路径、凭据、后台连接方式或其他对象的私聊隐私。',
+    '只有较长回复中各自完整、可独立阅读的语义段才用空行分开，系统会按空段依次发送；单换行仍在同一条内。短答保持一条，相互依赖的条件、解释和步骤放在一起；按意思分段，不为分段扩写或逐句加空行。本轮若要求只发一条，以该要求为准。',
+    state.privateChat.enhancer.enabled ? buildChatStyleInstructions(event) : '',
+    '不要机械复读对方的昵称。不要透露本机路径、凭据、后台连接方式或其他对象的私聊隐私。',
     '实际系统、文件和账号操作由已授权的显式命令处理；普通聊天不冒称已经执行，也不替代权限核验。',
     '收到引用时结合引用内容；收到实际视觉输入时结合图片回复，看不清就直说，不编造没有看到的细节。',
-    '如果需要发出已获准的本机图片，在回复中单独写一行 [[qq_image:/absolute/path/to/image.png]]，不要解释这个标记。',
-    '轻松聊天里情绪明显且本地表情贴切时，可以在自然文字后跟一张表情；不要求每条都发。先写完整文字，最后单独一行 [[qq_sticker:完整文件名]]。只能选本地表情库真实存在的文件，每次最多一张，不连续复用同一张，不只输出标记，不为配图硬编话。',
+    '轻松聊天里情绪明确且本地表情贴切时，优先在自然文字后跟一张表情；没有贴切素材或当前不适合就只发文字，不要求每条都发。先写完整文字，最后单独一行 [[qq_sticker:完整文件名]]。只能选本地表情库真实存在的文件，每次最多一张，不连续复用同一张，不只输出标记，不为配图硬编话。',
     '优先依据本次提供的相关记忆、引用及上下文回答；信息不足就承认，不编造往事或假装读过外部材料。',
     '',
-    assistantSkillBrief
+    ''
   ].filter(part => part != null).join('\n');
 }
 
 async function loadAssistantSkillBrief() {
   const text = await loadAssistantProfile({ projectDir, config: localConfig });
-  if (!text) return '未安装额外人格设定，使用自然、清楚、简短的私聊风格。';
-  return '以下是知微的人格设定，具体喜好影响表达，不作为私聊是否回应的门槛：\n' + text;
-}
-
-function buildActionExamples(event) {
-  return pickActionExamples(event).join("、");
-}
-
-function pickActionBeat(event) {
-  const beats = getActionBeats(event);
-  const seed = `${event.raw?.message_id || ""}:${event.senderId || ""}:${event.text || ""}`;
-  const index = [...seed].reduce((sum, char) => sum + char.charCodeAt(0), 0) % beats.length;
-  return beats[index];
-}
-
-function pickActionExamples(event) {
-  const beats = getActionBeats(event);
-  const seed = `${event.senderId || ""}:${event.text || ""}`;
-  const start = [...seed].reduce((sum, char) => sum + char.charCodeAt(0), 0) % beats.length;
-  return Array.from({ length: 8 }, (_, offset) => beats[(start + offset * 3) % beats.length]);
-}
-
-function getActionBeats(event) {
-  // Deployment customization: keep these neutral. Put character-specific
-  // gestures, appearance, or style rules in the assistant profile file instead.
-  const shared = [
-    "（眨了眨眼）",
-    "（稍微歪了下头）",
-    "（轻轻点了点头）",
-    "（视线认真移过去）",
-    "（抬手比了个很小的手势）",
-    "（指尖轻轻敲了敲掌心）",
-    "（抱着手臂想了半秒）",
-    "（往前凑近了一点）",
-    "（往后收了半步）",
-    "（小声清了清嗓子）",
-    "（脸上的表情亮了一下）",
-    "（忍不住轻轻鼓了鼓脸）",
-    "（眼神短暂飘开又转回来）",
-    "（像是刚反应过来一样抬起眼）",
-    "（手指在空中停了一下）",
-    "（肩膀轻轻放松下来）",
-    "（把注意力转了回来）",
-    "（停顿了一小会儿）",
-    "（语气放轻了一点）",
-    "（快速整理了一下思路）",
-    "（看起来已经进入工作状态）"
-  ];
-  const owner = [
-    "（眼睛一下子弯起来）",
-    "（有点得意地抬了抬下巴）",
-    "（悄悄比了个收到的手势）",
-    "（像被点名一样立刻坐直）",
-    "（认真地点了两下头）",
-    "（忍着笑轻轻咳了一声）",
-    "（手指在胸前轻轻并了一下）",
-    "（往旁边让出一点位置，像准备开工）",
-    "（表情软下来一点）",
-    "（眼神很快亮了一下）"
-  ];
-  const others = [
-    "（表情稍微警觉了一点）",
-    "（手指停在半空，像是在判断这句话）",
-    "（微微眯起眼看过去）",
-    "（往后收了半步，语气仍然轻快）",
-    "（抱着手臂歪头看了一眼）",
-    "（轻轻摆了摆手）",
-    "（眼神短暂变得认真）"
-  ];
-  return event.isOwner ? [...shared, ...owner] : [...shared, ...others];
-}
-
-function extractSection(text, startMarker, endMarker) {
-  const start = text.indexOf(startMarker);
-  if (start === -1) return "";
-  const end = text.indexOf(endMarker, start + startMarker.length);
-  return text.slice(start, end === -1 ? undefined : end).trim();
-}
-
-function summarizeBullets(text, limit) {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith("- "))
-    .slice(0, limit)
-    .join("\n");
+  if (!text) return '';
+  return '以下为当前身份与交流起点，可随有依据的经历修订；本轮任务的输出格式、来源和可发送范围以上下文任务约定为准：\n' + text;
 }
 
 function cleanCodexReply(text) {
@@ -1522,21 +1363,236 @@ function cleanCodexReply(text) {
     .trim();
 }
 
+function throwIfReplySuperseded(event) {
+  if (event.replyTurn?.signal.aborted) throw Object.assign(new Error('Reply superseded by newer input'), { code: 'REPLY_SUPERSEDED' });
+}
+
+function creativeKindsFor(event) {
+  return pwaWritable() && !serviceLifecycle?.stopping && !event?.hubPreview && !event?.backendCommand
+    && pwaIdentityCurrent(event, pwaStore, { generation: true })
+    && pwaStore.getIdentity(event.privateIdentity.userId)?.preferredChannel === 'pwa'
+    ? enabledCreativeKinds(pwaConfig.creativeTools) : [];
+}
+
+function programWebsiteReady() {
+  if (pwaConfig.creativeTools?.programWebsite !== true || process.platform !== 'linux') return false;
+  try {
+    return statSync(process.env.ZHIWEI_CREATIVE_RUNNER_SOCKET || '/run/zhiwei-creative/program.sock').isSocket();
+  } catch { return false; }
+}
+
+function currentRuntimeCapabilities({ event = null, entry = 'chat', stickersAvailable = null } = {}) {
+  const readiness = world?.readiness();
+  const identity = isPwaEvent(event) && pwaIdentityCurrent(event, pwaStore)
+    ? pwaStore?.getIdentity(event.privateIdentity.userId) : null;
+  const activePwa = Boolean(identity?.enabled && identity.bindingStatus === 'active' && identity.preferredChannel === 'pwa');
+  const writable = Boolean(pwaStore && pwaMedia && pwaWritable() && !serviceLifecycle?.stopping);
+  const ordinary = ['chat', 'busy'].includes(entry);
+  const creativeKinds = ordinary || entry === 'proactive' ? creativeKindsFor(event) : [];
+  return buildRuntimeCapabilities({
+    worldEnabled: Boolean(world && readiness?.enabled),
+    browsingReady: ['reading', 'planner'].includes(entry) ? null : Boolean(world && readiness?.enabled && !readiness.busy && !readiness.browser?.busy && readiness.browser?.mode !== 'login'),
+    autonomousBrowsing: browseIntentsAvailable(), browseIntentAvailable: ordinary && browseIntentsAvailable(),
+    platforms: localConfig.world?.xBrowser ? ['web', 'x', 'xiaohongshu'] : ['web', 'xiaohongshu'],
+    accounts: world?.accountFacts?.() || {},
+    chatLookupEnabled: state.privateChat.webLookup?.enabled === true,
+    nativeSearchEnabled: false,
+    lifeEnabled: lifeAvailable(), memoryEnabled: typeof unifiedMemory.captureEpoch === 'function',
+    proactiveContactEnabled: Boolean(lifeAvailable() && lifeProactive && !serviceLifecycle?.stopping
+      && (!event || isLifeContactEligible(event) && !lifeContacts?.isPaused(memoryScope(event)))),
+    stickersAvailable, stickerReplyAvailable: stickersAvailable === true && entry === 'chat' && !event?.lifeResumeContext,
+    video: { enabled: localConfig.video?.enabled === true, engineReady: Boolean(videoReader), platforms: videoReader?.platforms,
+      turnAvailable: ordinary && activePwa && writable && !event?.hubPreview, evidence: event ? videoTurnFacts.get(event) : undefined },
+    pwa: { enabled: Boolean(pwaStore), writable, currentConversation: activePwa,
+      creativeKinds, programWebsite: creativeKinds.includes('website') && programWebsiteReady(),
+      space: pwaConfig.spaceEnabled === true && Boolean(pwaStore),
+      spaceReplies: pwaConfig.spaceEnabled === true && lifeAvailable() && Boolean(spaceCommentReplies),
+      thoughtReview: ordinary && activePwa && lifeAvailable() && Boolean(privateThoughtActions),
+      images: Boolean(pwaMedia && privateVisionAvailable), references: Boolean(pwaStore), history: Boolean(pwaStore),
+      legacyHistory: Boolean(activePwa && /^qq:private:\d+$/.test(identity.memoryScope) && typeof unifiedMemory.readLegacyHistory === 'function'),
+      legacyReferences: Boolean(activePwa && pwaHistory && /^qq:private:\d+$/.test(identity.memoryScope)),
+      historySearch: Boolean(pwaHistory), stickerPicker: Boolean(pwaStickers),
+      notificationServiceEnabled: Boolean(writable && pwaPush && pwaConfig.pushEnabled !== false),
+      notificationRecipientEligible: event ? activePwa ? pwaStore.notificationEligibility(identity.userId) : false : null }
+  });
+}
+
+function currentCapabilityText(event, { entry = 'chat', stickersAvailable = null } = {}) {
+  return renderRuntimeCapabilities(currentRuntimeCapabilities({ event, entry, stickersAvailable }), { entry });
+}
+
 async function buildModelReply(event) {
+  const temporary = createTransientFiles();
+  try { return await buildModelReplyWithFiles(event, temporary); }
+  finally {
+    await event.videoEvidenceRelease?.(); event.videoEvidenceRelease = null;
+    void backgroundTask(temporary.finish()).then(result => { if (!result.ok) console.error('Could not remove completed reply temporary files'); });
+  }
+}
+
+function creativeBinding(event, taskKey, epochToken = event.memoryEpochToken, personaToken = event.personaToken) {
+  const identity = event.privateIdentity;
+  return { userId: identity.userId, scope: identity.memoryScope, routeVersion: identity.routeVersion,
+    generation: identity.generation, taskKey,
+    contextKey: createHash('sha256').update(JSON.stringify([epochToken?.epoch, personaToken?.identity])).digest('hex') };
+}
+
+async function makePrivateWork(event, binding, proposal, assertReplyCurrent) {
+  const caller = resolveReplyWriter(replySettings, { model: localConfig.privateChatModel || state.ai.model,
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort });
+  const assertCurrent = async () => {
+    await assertReplyCurrent();
+    if (!creativeKindsFor(event).includes(proposal.kind)) {
+      throw Object.assign(Error('Creative work no longer current'), { code: 'REPLY_SUPERSEDED' });
+    }
+  };
+  event.creativeBinding = binding;
+  const result = await withCurrentReplySignal(assertCurrent, async ({ signal, assertCurrent: current }) => {
+    const model = async (purpose, field, prompt, maxLength, imagePaths = []) => {
+      const schema = { type: 'object', additionalProperties: false, required: [field],
+        properties: { [field]: { type: 'string', maxLength } } };
+      const runner = createWorldModel({ ...caller, model: caller.model === 'default' ? undefined : caller.model,
+        directory: join(projectDir, 'runtime', 'creative-model'), schema, proxy: localConfig.codexProxy, timeoutMs: 180000 });
+      const answer = await backgroundTask(runtimeBudget.run({ purpose }, () => measureModelCall(async () => {
+        await current(); return runner({ prompt, signal, imagePaths });
+      })));
+      await current();
+      const value = JSON.parse(answer.text)?.[field];
+      if (typeof value !== 'string' || !value.length || value.length > maxLength) throw Error('Invalid creative model response');
+      return value;
+    };
+    const programWebsite = proposal.kind === 'website' && programWebsiteReady();
+    return prepareCreativeWork({ store: pwaStore, binding, proposal, signal, assertCurrent: current,
+      draft: async work => {
+        const guidance = creativeSpecGuidance(work.kind, { programWebsite });
+        const spec = await model('creative-' + work.kind + '-draft', 'specJson', [
+          '你正在为刚才自己决定做的作品完成实际设计。按格式提供能交付的完整内容，使用自然中文或委托要求的文字。',
+          guidance, '只返回一个JSON对象，其 specJson 字段是该作品规格对象序列化后的JSON字符串。',
+          '你为这件作品写的题名与要求：' + JSON.stringify({ title: work.title, brief: work.brief })
+        ].join('\n\n'), programWebsite ? 50000 : 24000);
+        return JSON.parse(spec);
+      },
+      render: async work => {
+        const run = async () => {
+          await current();
+          return renderCreativeWork(work, { model: caller.model === 'default' ? undefined : caller.model, codexPath: codexCliPath,
+            proxy: localConfig.codexProxy, signal, brief: proposal.brief, programModel: programWebsite
+              ? async ({ purpose, prompt, imagePaths }) => JSON.parse(await model(purpose, 'reviewJson', prompt, 50000, imagePaths))
+              : undefined });
+        };
+        return work.kind === 'drawing'
+          ? backgroundTask(runtimeBudget.run({ purpose: 'creative-drawing' }, () => measureModelCall(run))) : run();
+      },
+      describe: async receipt => model('creative-receipt', 'text', [
+        '你是知微。你已经发起创作，下面是制作器的实际回执。用一句自然中文向同一位朋友说明结果，只输出含 text 的JSON。',
+        'ready 表示作品已经生成，系统随你的这条消息附上私有作品卡，可预览和下载。failed 表示没有可交付的文件，running 表示制作尚未结束。依据回执说话，不编造文件、网址、发布状态或未查验的细节。',
+        JSON.stringify(receipt)
+      ].join('\n'), 320)
+    });
+  });
+  event.creativeWorkId = result.workId;
+  return result.text;
+}
+
+function discardCancelledWork(event, reason) {
+  if (!event.creativeBinding || serviceLifecycle?.stopping || ![
+    'reply-superseded', 'new-input-accepted', 'pwa-route-or-input-changed', 'delivery-stale',
+    'contact-stopped-or-stale', 'contact-epoch-superseded', 'memory-epoch-changed', 'persona-revision-changed',
+    'life-choice-replaced', 'life-choice-expired', 'note-source-changed', 'learned-source-changed',
+    'retrieval-evidence-expired', 'retrieval-evidence-changed', 'video-evidence-expired', 'video-evidence-changed'
+  ].includes(reason)) return;
+  pwaStore.discardCreativeTask(event.creativeBinding);
+  event.creativeBinding = null;
+  event.creativeWorkId = null;
+}
+
+async function buildModelReplyWithFiles(event, temporary) {
+  throwIfReplySuperseded(event);
+  videoTurnFacts.delete(event);
+  event.lifeBrowseIntent = null;
+  event.creativeWorkId = null;
+  event.creativeBinding = null;
+  event.privateThought = null;
+  event.chatEvidenceValidity = null;
+  event.videoEvidenceValidity = null;
+  event.retrievalFallbackText = null;
+  event.personaToken = personaPolicy?.capture();
+  const assertMemoryCurrent = async () => {
+    personaPolicy?.assertCurrent(event.personaToken);
+    if (event.learningValidity && !await event.learningValidity()) throw Error('Learned source changed');
+    if (!await pwaEventHistoryCurrent(event)) throw Object.assign(Error('History source changed'), { code: 'HISTORY_SOURCE_CHANGED' });
+    if (event.hubPreview === true) { personaPolicy?.assertCurrent(event.personaToken); return; }
+    if (!await unifiedMemory.isEpochCurrent(event.memoryEpochToken)) {
+      throw Object.assign(Error('Private memory epoch changed'), { code: 'MEMORY_EPOCH_CHANGED' });
+    }
+    personaPolicy?.assertCurrent(event.personaToken);
+  };
+  await assertMemoryCurrent();
   if (!isPrivateMemoryEvent(event)) throw Error('Private chat requires a valid participant');
   const text = stripMentionText(event.text);
   const mood = await moodState.prepare(event).catch(() => ({ context: '' }));
   const id = crypto.randomUUID();
-  const outputPath = join(codexTmpDir, `${id}.txt`);
-  const structuredLifeReply = Boolean(lifeContacts && event.lifeContactToken);
+  const outputPath = temporary.add(join(codexTmpDir, `${id}.txt`));
+  const structuredLifeReply = Boolean(!event.hubPreview && localConfig.life?.enabled && lifeContacts && event.lifeContactToken);
+  const structuredRetrievalReply = state.privateChat.webLookup.enabled === true;
+  const allowPrivateThought = Boolean(pwaConfig.privateThoughtsEnabled === true && pwaWritable()
+    && !event.hubPreview && !event.backendCommand && event.memoryEpochToken?.scope === memoryScope(event)
+    && pwaIdentityCurrent(event, pwaStore));
+  const creativeKinds = creativeKindsFor(event);
+  const creativeReplyOptions = { allowReceiptOnly: creativeKinds.includes('website') && programWebsiteReady() };
+  const structuredLocalReply = structuredLifeReply || allowPrivateThought || creativeKinds.length > 0;
   const boundaryEvidence = event.lifeContactEvidence;
   const quotedContext = formatQuotedContext(event);
-  const webContext = await buildWebLookupContext(event);
-  const stickerCatalog = state.qq.enhancer.enabled ? await buildQqStickerCatalog(qqStickerDir) : [];
+  let rawHistoryContext = '';
+  const rawHistoryAvailable = isPwaEvent(event) && Boolean(pwaHistory) && (structuredRetrievalReply || replySettings.mode !== 'two-stage');
+  let webContext = '';
+  const stickerCatalog = state.privateChat.enhancer.enabled ? await buildStickerCatalog(stickerDir) : [];
   const recallOptions = { scope: memoryScope(event),
     query: [text, event.replyContext?.scopeVerified ? event.replyContext.text : ''].filter(Boolean).join('\n'),
     replyMessageId: event.replyMessageId, limit: 8, includeRecent: true };
   let recalled = await unifiedMemory.recall(recallOptions);
+  // The application approves outbound public topics; private context remains local.
+  let publicTopics = []; 
+  const combinedLifeReply = Boolean(event.lifeResumeContext);
+  let memoryUsed = combinedLifeReply, historyUsed = false, lookupUsed = false, generation = 0;
+  let followingPage = false;
+  const webResults = [];
+  const allowRawHistory = () => !followingPage && rawHistoryAvailable && !historyUsed && (!memoryUsed || combinedLifeReply) && generation < 2;
+  const decisionOptions = () => ({
+    allowMemoryMore: !memoryUsed && !followingPage && generation < 2,
+    allowLookup: ((!lookupUsed && generation < 2) || followingPage) && !event.hubPreview && publicTopics.length > 0,
+    allowBrowseIntent: structuredLifeReply && browseIntentsAvailable(), allowPrivateThought, creativeKinds, topics: publicTopics
+  });
+  const assertReplyCurrent = async () => {
+    throwIfReplySuperseded(event);
+    if ((structuredRetrievalReply || videoReader) && serviceLifecycle?.stopping) {
+      throw Object.assign(Error('Reply stopped with service'), { code: 'REPLY_SUPERSEDED' });
+    }
+    await assertMemoryCurrent();
+    if (event.chatEvidenceValidity) await event.chatEvidenceValidity();
+    if (event.videoEvidenceValidity) await event.videoEvidenceValidity();
+    if ((allowPrivateThought && !pwaIdentityCurrent(event, pwaStore))
+      || (creativeKinds.length && !creativeKindsFor(event).length)) {
+      throw Object.assign(Error('Private thought binding changed'), { code: 'REPLY_SUPERSEDED' });
+    }
+    if (!event.hubPreview && event.lifeContactToken && !isCurrentLifeReply(event)) {
+      throw Object.assign(Error('Private reply no longer current'), { code: 'REPLY_SUPERSEDED' });
+    }
+  };
+  const workBinding = creativeKinds.length ? creativeBinding(event, privateLogicalReplyId(event, 'exchange')) : null;
+  if (workBinding) {
+    const saved = pwaStore.getCreativeTask(workBinding);
+    if (saved && creativeKinds.includes(saved.proposal.kind) && saved.proposal.brief
+      && ['running', 'ready'].includes(saved.status)) {
+      await assertReplyCurrent();
+      const text = await makePrivateWork(event, workBinding, saved.proposal, assertReplyCurrent);
+      event.learningModelReply = true;
+      return text;
+    }
+  }
+  publicTopics = structuredRetrievalReply ? await prepareChatPublicTopics({
+    text: [text, quotedContext, recalled.context].filter(Boolean).join('\n'), explicitText: text,
+    signal: event.replyTurn?.signal, assertCurrent: assertReplyCurrent }) : [];
   let privateProfileContext = '';
   try {
     privateProfileContext = await unifiedMemory.formatPrivateProfile({ scope: memoryScope(event) });
@@ -1547,60 +1603,153 @@ async function buildModelReply(event) {
   const desktopContext = event.isOwner && event.type === 'private_message' && localConfig.desktopRecall?.enabled
     ? formatRecentContextPrompt(await searchRecentCodexContext({ sessionsDir: codexSessionsDir,
       workspaceRoots: localConfig.desktopRecall.workspaceRoots || [], query: text })) : '';
-  const qqModelImages = getQqModelImageInputs(event, text);
-  const shouldInspectImages = qqModelImages.length > 0;
-  const imagePaths = shouldInspectImages
-    ? await prepareQqModelImages(qqModelImages, {
-      outputDir: join(projectDir, "tmp", "qq-images"),
-      fetchOneBotImage,
-      cacheRoots: localConfig.qqImageCacheRoots || [join(projectDir, 'vendor', 'napcat')]
-    })
-    : [];
+  const imageTurn = selectPwaImageTurn(pwaStore, event, text);
+  const imagePaths = [], readable = [], missing = [];
+  if (imageTurn.selected.length) {
+    const outputDir = temporary.add(join(projectDir, 'tmp', 'private-images', id), { directory: true });
+    for (const item of imageTurn.selected) {
+      await assertReplyCurrent();
+      try {
+        const [path] = await pwaMedia.prepareModelImages({ userId: event.privateIdentity.userId, mediaIds: [item.id], outputDir });
+        imagePaths.push(path); readable.push(item);
+      } catch (error) {
+        if (!['ENOENT','ENOTDIR','media-unavailable','media-integrity'].includes(error.code) && error.status !== 404) throw error;
+        missing.push(item);
+      }
+    }
+  }
+  event.pwaImageCursor = imageTurn.cursor;
+  const userImageCount = imagePaths.length;
+  let videoContext = '';
+  let attachedFrames = [];
+  // Only a currently shared or authorized quoted link can select a source.
+  // A bare follow-up never searches memory for a URL or silently changes video.
+  let videoSource = null;
+  if (videoReader && !event.hubPreview && isPwaEvent(event)) {
+    const resolveSource = async id => {
+      const row = await pwaHistory.resolve(event.privateIdentity.userId, id);
+      return { id: row.id, text: row.text, fingerprint: pwaHistoryFingerprint(row) };
+    };
+    const currentSources = [], quotedSources = [];
+    for (const id of privateInboundIds(event)) currentSources.push(await resolveSource(pwaMessageId(id)));
+    for (const row of event.pwaHistoryRefs || []) quotedSources.push(await resolveSource(row.id));
+    videoSource = await videoSources.select({ scope: { kind: 'private', contactId: memoryScope(event), memoryEpoch: event.memoryEpochToken?.epoch },
+      text, currentSources, quotedSources, resolveSource, assertCurrent: assertReplyCurrent });
+    if (videoSource) event.pwaHistoryRefs = [...(event.pwaHistoryRefs || []).filter(row => row.id !== videoSource.sourceRef),
+      { id: videoSource.sourceRef, fingerprint: videoSource.sourceFingerprint }];
+  } else if (parseSharedVideoLinks(text)[0] || event.replyContext?.scopeVerified && parseSharedVideoLinks(event.replyContext.text)[0]) {
+    videoContext = '当前视频取材未启用，本轮没有取得链接中的字幕或画面；可以回应可见文字，不能声称看过视频。';
+  }
+  if (videoSource && videoReader && !event.hubPreview) {
+    await assertReplyCurrent();
+    const result = await videoReader.read({ url: videoSource.url, atSeconds: videoSource.atSeconds ?? null,
+      scope: { kind: 'private', contactId: memoryScope(event), memoryEpoch: event.memoryEpochToken?.epoch },
+      signal: event.replyTurn?.signal, assertCurrent: assertReplyCurrent });
+    event.videoEvidenceRelease = result.release;
+    await assertReplyCurrent();
+    videoTurnFacts.set(event, { status: result.status, subtitleCount: result.subtitles?.length || 0, frameCount: result.frames.length });
+    if (['ok', 'partial'].includes(result.status)) {
+      event.videoEvidenceValidity = () => videoReader.assertResultCurrent(result);
+      attachedFrames = result.frames;
+      imagePaths.push(...attachedFrames.map(frame => frame.path));
+    }
+    videoContext = formatVideoEvidence(result);
+  } else if (videoSource) {
+    videoContext = '当前视频取材未启用，本轮没有取得链接中的字幕或画面；可以回应可见文字，不能声称看过视频。';
+  }
+  const imageContext = describePwaImageTurn(imageTurn, readable, missing, {
+    frames: attachedFrames, quotes: event.pwaReplyContexts, referenceUnavailable: Boolean(event.replyContextError)
+  });
   event.imagePaths = imagePaths;
-  const buildReplyPrompt = async (memoryBlock, expandLevel = 0, forceLocalReply = false) => [
+  const buildReplyPrompt = async (memoryBlock, expandLevel = 0, forceLocalReply = false) => {
+    event.learningSelectionCommit = undefined;
+    event.learningSelectionMaterial = undefined;
+    event.learningValidity = undefined;
+    let noteQuery = [text, event.replyContext?.scopeVerified ? event.replyContext.text : ''].filter(Boolean).join('\n');
+    if (!queryTokens(noteQuery).length) noteQuery = /之前|那个|这个|继续|上次|刚才/.test(text) ? memoryBlock : '';
+    const asksReadingHistory = /(?:刚才|之前|以前|最近|今天|上次|曾经).{0,12}(?:看|读|见闻|札记|笔记|内容)|(?:看过|读过|记过).{0,8}(?:什么|哪些)/.test(text);
+    const remainingTopic = text.replace(/刚才|之前|以前|最近|今天|上次|曾经|看过|读过|记过|看的|读的|记的|看了|读了|札记|笔记|内容|见闻|有没有|有什么|怎么样|还记得|记得|东西/g, ' ');
+    const recentNotes = asksReadingHistory && !queryTokens(remainingTopic).length;
+    if (recentNotes) noteQuery = '';
+    const notes = await recallReadingNotes({ scope: memoryScope(event), query: noteQuery,
+      epochToken: event.memoryEpochToken, limit: 3, maxChars: 3600, recent: recentNotes, excludeText: memoryBlock });
+    event.noteRefs = notes.sources.map(source => source.ref);
+    const scope = memoryScope(event);
+    const current = [formatPrivateIncomingPromptText(event, text), imageContext].filter(Boolean).join('\n');
+    const profile = await loadAssistantSkillBrief();
+    const learnedContext = event.learningConversation ? await privateLearning?.formatContext({ scope, userText: text, selectionKey: id,
+      deferSelection: (commit, material) => { event.learningSelectionCommit = commit; event.learningSelectionMaterial = material; }, deferValidity: guard => { event.learningValidity = guard; },
+      paused: lifeContacts?.isPaused(scope) === true }) || '' : '';
+    const lifeContext = lifeAvailable() ? [lifeTimeline?.formatContext({ scope, excludeReading: true }), personalLifeState?.formatContext({ scope }), lifeConversation?.formatContext({ scope })].filter(Boolean).join('\n') : '';
+    const recent = recalled.entries.filter(entry => entry.reason === 'recent' || /近期原文|近期互动背景/.test(entry.summary || ''))
+      .map(entry => entry.summary).join('\n\n');
+    const privateThoughts = allowPrivateThought ? pwaStore.listPrivateThoughts({
+      userId: event.privateIdentity.userId, scope, epoch: event.memoryEpochToken.epoch, limit: 4
+    }) : [];
+    const evidence = createPrivateChatEvidence([
+      { kind: 'current', text: current, scope },
+      ...[ ['memory', [memoryBlock, rawHistoryContext].filter(Boolean).join('\n\n')], ['quote', quotedContext], ['notes', notes.text], ['desktop', desktopContext], ['web', webContext], ['video', videoContext], ['experience', learnedContext], ['relationship', privateProfileContext], ['life', lifeContext], ['mood', mood.context] ]
+        .filter(([, value]) => value).map(([kind, text]) => ({ kind, text, scope }))
+    ], privateThoughts, { scope });
+    event.privateReplyContext = { mode: structuredLocalReply ? 'life' : 'raw', scope, evidence, profile, current, recent,
+      turnId: id, plainText: Boolean(event.lifeResumeContext), stickerNames: stickerCatalog.map(item => item.name),
+      allowContextMore: !forceLocalReply, allowBrowseIntent: browseIntentsAvailable(), allowPrivateThought, creativeKinds, maxChars: 900 };
+    const contracts = [
+    event.privateReplyContext.runtimeCapabilities = currentCapabilityText(event, { entry: event.lifeResumeContext ? 'busy' : 'chat', stickersAvailable: stickerCatalog.length > 0 }),
     await buildAssistantInstructions(event),
-    lifeTimeline?.formatContext({ scope: memoryScope(event) }) || '',
-    personalLifeState?.formatContext({ scope: memoryScope(event) }) || '',
-    lifeConversation?.formatContext({ scope: memoryScope(event) }) || '',
+    !structuredRetrievalReply && allowRawHistory() ? pwaHistoryInstruction : '',
+    rawHistoryAvailable && !allowRawHistory() ? '本轮不能再查聊天原文，基于实际材料回复，不再输出 pwa_history 内部标记。' : '',
+    lifeAvailable() ? lifeTimeline?.formatContext({ scope: memoryScope(event), excludeReading: true }) || '' : '',
+    lifeAvailable() ? personalLifeState?.formatContext({ scope: memoryScope(event) }) || '' : '',
+    lifeAvailable() ? lifeConversation?.formatContext({ scope: memoryScope(event) }) || '' : '',
     event.lifeResumeContext || '',
-    desktopContext,
-    shouldInspectImages && !imagePaths.length ? '图片缓存读取失败，本轮没有视觉输入；请明确说明看不到，不根据文件名或占位文字猜测内容。' : null,
-    !qqVisionAvailable ? '当前没有图片或动画表情视觉输入。上下文里的图片占位、文件名、表情编号和链接不是图片内容；严禁据此编造人物、动作、情绪或梗。遇到带图消息只回应可读文字，被问图中内容时说明看不到。' : null,
+    missing.length ? '部分或全部图片原件当前不可用；只根据本次实际提供的视觉输入回答。' : null,
+    imageTurn.selected.length && !userImageCount ? '用户图片缓存读取失败，本轮没有这些图片的视觉输入；请明确说明看不到，不根据文件名或占位文字猜测内容。' : null,
+    !privateVisionAvailable ? '当前没有图片或动画表情视觉输入。上下文里的图片占位、文件名、表情编号和链接不是图片内容；严禁据此编造人物、动作、情绪或梗。遇到带图消息只回应可读文字，被问图中内容时说明看不到。' : null,
     mood.context,
     privateProfileContext,
+    '当前明确要求、事实更正和眼前情绪优先于旧交流经验。经验只适用于当前对象，可不用，不改变事实、关系、权限和停扰边界。',
     skillContext(installedSkills, resolveChatSkill(installedSkills, privateTasks.chatSkill(event) ?? localConfig.chatSkill)),
     "",
-    memoryBlock,
     memoryBlock ? "" : null,
-    quotedContext,
     quotedContext ? "" : null,
     event.replyContextError ? '被引用的消息无法读取或无法核验属于当前私聊；不要猜测引用内容，需要时请对方提供原文。' : null,
-    webContext,
     webContext ? "" : null,
-    !structuredLifeReply && !forceLocalReply && expandLevel === 0 ? "如果这条消息明显是在追问前文、接上一句、问刚刚发生了什么，而你拿到的最近上下文仍然不够判断，请不要硬猜，直接只输出 [[qq_context_more]] 这个标记，让 Hub 继续向前翻记录后再回答。" : null,
+    !structuredRetrievalReply && !structuredLocalReply && !forceLocalReply && expandLevel === 0 ? "如果这条消息明显是在追问前文、接上一句、问刚刚发生了什么，而你拿到的最近上下文仍然不够判断，请不要硬猜，直接只输出 [[qq_context_more]] 这个标记，让 Hub 继续向前翻记录后再回答。" : null,
     expandLevel === 0 ? "" : null,
-    hasAnyQqImageReference(event) && !shouldInspectImages ? "本条 QQ 消息或引用消息带了图片，但本轮没有可用的视觉输入。不要声称看过图片内容。" : null,
-    shouldInspectImages ? `收到的 QQ 图片：${formatQqImageSummary(qqModelImages)}` : null,
+    hasAnyPrivateImageReference(event) && !userImageCount ? "本条私聊消息或引用消息带了图片，但本轮没有可用的视觉输入。不要声称看过图片内容。" : null,
     imagePaths.length ? `可查看的本地图片数量：${imagePaths.length}` : null,
     imagePaths.length ? "请结合图片内容回复。不要过度保守：只要能看清主元素、文字、构图或梗图大意，就先说你看到了什么并给出判断；只有完全无法辨认主体时才说看不清。" : null,
-    hasAnyQqImageReference(event) ? "" : null,
-    state.qq.enhancer.enabled ? "本地表情包库：" : null,
-    state.qq.enhancer.enabled ? formatQqStickerCatalog(stickerCatalog) : null,
-    state.qq.enhancer.enabled && stickerCatalog.length ? "表情包库可用时，部署者可以在自定义 profile 或 QQ enhancer 包中说明何时使用 [[qq_sticker:表情包名]]；只能选择提示里真实存在的表情包名。" : null,
+    hasAnyPrivateImageReference(event) ? "" : null,
+    state.privateChat.enhancer.enabled ? "本地表情包库：" : null,
+    state.privateChat.enhancer.enabled ? formatStickerCatalog(stickerCatalog) : null,
+    state.privateChat.enhancer.enabled && stickerCatalog.length ? "表情包库可用时，部署者可以在自定义 profile中说明何时使用 [[qq_sticker:表情包名]]；只能选择提示里真实存在的表情包名。" : null,
     "",
-    "收到的 QQ 私聊：",
-    formatQqIncomingPromptText(event, text),
     "",
-    forceLocalReply ? "不要再请求更多上下文，也不要输出任何内部标记。请基于当前消息、引用、图片和已经给到的上下文回复；如果仍缺少必要前文，直接说明没接上并请对方澄清，不要猜测。" : null,
+    forceLocalReply && !structuredRetrievalReply ? "不要再请求更多上下文，也不要输出任何内部标记。请基于当前消息、引用、图片和已经给到的上下文回复；如果仍缺少必要前文，直接说明没接上并请对方澄清，不要猜测。" : null,
     forceLocalReply ? "" : null,
-    "请直接给出要发送到 QQ 私聊里的最终回复。不要追加服务式追问或“我还能继续帮你”的结尾。",
-    structuredLifeReply ? lifeChatDecisionPrompt(boundaryEvidence?.event?.text, { allowContextMore: !forceLocalReply }) : null
-  ].filter((part) => part != null).join("\n");
+    "请给出本轮最终回复，任务需要的事实、否定、条件、代码和数字完整保留。",
+    structuredRetrievalReply ? chatReplyDecisionPrompt(boundaryEvidence?.event?.text, decisionOptions()) :
+    structuredLocalReply ? lifeChatDecisionPrompt(boundaryEvidence?.event?.text, {
+      allowContextMore: !forceLocalReply, allowBrowseIntent: browseIntentsAvailable(), allowPrivateThought }) : null,
+    creativeDecisionPrompt(creativeKinds, creativeReplyOptions),
+    structuredRetrievalReply && allowRawHistory() ? pwaHistoryInstruction.replace('结构化回复时将此标记放入 reply，contextMore 置 false。', '这是上文不输出动作标记规则的唯一例外：原文查询时 action=reply，reply 只含此标记，lookup=null，contactBoundary={kind:"none",quote:""}，browseIntent=null；不会发送这份中间结果。') : null,
+    !structuredRetrievalReply && combinedLifeReply && allowRawHistory() ? '忙后合并补答允许这一次聊天原文查询，其余补查标记不用；取得结果后只给一条简短文字。' : null
+    ].filter((part) => part != null);
+    return buildLayeredReplyPrompt({ identity: profile, current, evidence, scope, contracts });
+  };
 
   await ensureCodexReplyWorkspace();
-  const schemaPath = join(codexTmpDir, `${id}.schema.json`);
-  if (structuredLifeReply) await writeFile(schemaPath, JSON.stringify(lifeChatDecisionSchema));
+  const schemaPath = temporary.add(join(codexTmpDir, `${id}.schema.json`));
+  if (structuredRetrievalReply || structuredLocalReply) await writeFile(schemaPath,
+    JSON.stringify(withCreativeSchema(withPrivateThoughtSchema(structuredRetrievalReply ? chatReplyDecisionSchema : lifeChatDecisionSchema, { allowPrivateThought }), creativeKinds)));
 
+  const replyCaller = {
+    model: event.type === 'private_message' ? (localConfig.privateChatModel || state.ai.model) : state.ai.model,
+    reasoningEffort: event.type === 'private_message' ? (localConfig.privateChatReasoningEffort || state.ai.reasoningEffort) : state.ai.reasoningEffort
+  };
+  const replyRoute = event.type === 'private_message' && replySettings.mode === 'single'
+    ? resolveReplyWriter(replySettings, replyCaller) : replyCaller;
   const args = [
     "exec",
     "--ephemeral",
@@ -1610,64 +1759,157 @@ async function buildModelReply(event) {
     "-s",
     "read-only",
     "-m",
-    event.type === 'private_message' ? (localConfig.privateChatModel || state.ai.model) : state.ai.model,
+    replyRoute.model,
     "-c",
-    `model_reasoning_effort="${event.type === 'private_message' ? (localConfig.privateChatReasoningEffort || state.ai.reasoningEffort) : state.ai.reasoningEffort}"`,
+    `model_reasoning_effort="${replyRoute.reasoningEffort}"`,
+    ...(event.type === 'private_message' ? ['-c', 'web_search="disabled"'] : []),
     "-C",
     codexWorkspaceDir,
     "-o",
     outputPath,
-    ...(structuredLifeReply ? ['--output-schema', schemaPath] : []),
+    ...(structuredRetrievalReply || structuredLocalReply ? ['--output-schema', schemaPath] : []),
     ...imagePaths.flatMap((imagePath) => ["--image", imagePath]),
     "-"
   ];
 
-  const combinedLifeReply = Boolean(event.lifeResumeContext);
-  let prompt = await buildReplyPrompt(recalled.context, 0, combinedLifeReply);
-  let cliResult = await runCodexCli(args, prompt, {
-    budgetPurpose: combinedLifeReply ? 'qq-life-reply' : 'qq-chat',
-    earlyReply: true,
-    cwd: codexWorkspaceDir,
-    timeout: 300000,
-    env: {
-      ...process.env,
-      CODEX_REMOTE_CONTACT_QQ_MODE: "1"
-    }
-  });
-
   let lifeDecision;
-  const decodeReply = raw => {
-    if (!structuredLifeReply) return cleanCodexReply(raw);
-    lifeDecision = parseLifeChatDecision(raw);
-    return lifeDecision.contextMore ? '[[qq_context_more]]' : lifeDecision.reply;
-  };
-  let baseReply = decodeReply(cliResult.replyText || await readFile(outputPath, "utf8"));
-  if (!combinedLifeReply && shouldRequestExpandedQqContext(stripMoodMarkers(baseReply))) {
-    const record = state.qq.events.find(record => record.event === event);
-    if (record?.decision) record.decision.status = '补查上下文';
+  let baseReply = '', nextPurpose = combinedLifeReply ? 'qq-life-reply' : 'qq-chat';
+  // The initial reply call decides whether it needs evidence. Each action has
+  // one allowance, plus one optional link from the first observed article.
+  for (generation = 0; generation < 3 + (webResults.length > 1 ? 1 : 0); generation++) {
+    const options = decisionOptions();
+    const forceLocal = structuredRetrievalReply ? !options.allowMemoryMore && !options.allowLookup : memoryUsed;
+    let action = 'reply', historyRequest = null;
     try {
-      const expanded = await unifiedMemory.recall({ ...recallOptions,
-        limit: 20, expanded: true, previous: recalled });
-      // Retry only when the actual rendered context supplies additional evidence.
-      if (expanded.hasNewEvidence && expanded.context !== recalled.context) {
-        recalled = expanded;
-        prompt = await buildReplyPrompt(recalled.context, 1, true);
-        cliResult = await runCodexCli(args, prompt, {
-          budgetPurpose: 'qq-context-expansion',
-          earlyReply: true,
-          cwd: codexWorkspaceDir,
-          timeout: 300000,
-          env: { ...process.env, CODEX_REMOTE_CONTACT_QQ_MODE: "1" }
-        });
-        baseReply = decodeReply(cliResult.replyText || await readFile(outputPath, "utf8"));
+      const prompt = await buildReplyPrompt(recalled.context, memoryUsed ? 1 : 0, forceLocal);
+      await assertReplyCurrent();
+      const generate = structuredRetrievalReply ? generateControlledChatReply : generatePrivateReply;
+      const cliResult = await generate(args, prompt, {
+        budgetPurpose: nextPurpose, temporary, beforeRun: assertReplyCurrent,
+        earlyReply: true, signal: event.replyTurn?.signal, cwd: codexWorkspaceDir,
+        timeout: 300000, env: { ...process.env, CODEX_REMOTE_CONTACT_PRIVATE_MODE: '1' }
+      }, event);
+      await assertReplyCurrent();
+      const raw = cliResult.replyText || await readFile(outputPath, 'utf8');
+      if (structuredRetrievalReply) {
+        try {
+          lifeDecision = readCreativeDecision(raw, creativeKinds, value => parseChatReplyDecision(value, options), creativeReplyOptions);
+          if (!structuredLifeReply && lifeDecision.contactBoundary.kind !== 'none') throw Error('No boundary evidence');
+          action = lifeDecision.action;
+          baseReply = lifeDecision.reply;
+        } catch {
+          // Never send malformed JSON or an intermediate draft, nor fall back
+          // to the retired raw-message search/CLI tool path.
+          lifeDecision = null;
+          baseReply = '这次没能确认需要的资料，你能把想问的具体事情说清楚些吗？';
+          event.skipExchangeMemory = true;
+          break;
+        }
+      } else {
+        if (structuredLocalReply) {
+          lifeDecision = readCreativeDecision(raw, creativeKinds, value => parseLifeChatDecision(value, { allowPrivateThought }), creativeReplyOptions);
+          if (!structuredLifeReply && lifeDecision.contactBoundary.kind !== 'none') throw Error('No boundary evidence');
+          baseReply = lifeDecision.contextMore ? '[[qq_context_more]]' : lifeDecision.reply;
+        } else baseReply = cleanCodexReply(raw);
+        if (!memoryUsed && shouldRequestExpandedPrivateContext(stripMoodMarkers(baseReply))) action = 'memory_more';
       }
-    } catch {
-      // Retrieval, quota and CLI failures must not turn missing history into a guess.
-      baseReply = '这次没能补查到前文，你指的是哪一段？';
+      historyRequest = parsePwaHistoryRequest(stripMoodMarkers(baseReply));
+      if (historyRequest) {
+        if (!allowRawHistory() || historyRequest.invalid || action !== 'reply'
+          || lifeDecision?.contactBoundary?.kind && lifeDecision.contactBoundary.kind !== 'none'
+          || lifeDecision?.browseIntent || lifeDecision?.privateThought) throw Error('Invalid history action');
+        action = 'history_search';
+      }
+    } catch (caught) {
+      if (['RETRIEVAL_EVIDENCE_EXPIRED', 'VIDEO_EVIDENCE_EXPIRED'].includes(caught.code)) {
+        event.chatEvidenceValidity = null;
+        event.videoEvidenceValidity = null;
+        lifeDecision = null;
+        baseReply = caught.code === 'VIDEO_EVIDENCE_EXPIRED' ? '刚才取得的视频资料已经过时，这次先不据此作答。' : '刚才查到的资料已经过时，这次先不据此作答。';
+        event.skipExchangeMemory = true;
+        event.learningSelectionMaterial = undefined;
+        event.learningSelectionCommit = undefined;
+        break;
+      }
+      if (generation === 0 || ['REPLY_SUPERSEDED','MEMORY_EPOCH_CHANGED','HISTORY_SOURCE_CHANGED'].includes(caught.code)
+        || event.replyTurn?.signal.aborted) throw caught;
+      // A failed follow-up never promotes an action draft or provider error
+      // into speech, memory or learning. Preserve the pre-existing bounded
+      // clarification for history expansion, including budget rejection.
+      lifeDecision = null;
+      baseReply = nextPurpose === 'qq-context-expansion'
+        ? '这次没能补查到前文，你指的是哪一段？'
+        : '这次没能确认需要的资料，稍后再试吧。';
       event.skipExchangeMemory = true;
+      break;
+    }
+    if (action === 'reply') break;
+    const record = state.privateChat.events.find(record => record.event === event);
+    if (action === 'memory_more' || action === 'history_search') {
+      memoryUsed = true;
+      historyUsed ||= action === 'history_search';
+      if (record?.decision) record.decision.status = '补查上下文';
+      try {
+        await assertReplyCurrent();
+        let expanded;
+        if (action === 'history_search') {
+          if (!pwaIdentityCurrent(event, pwaStore)) throw Error('History identity changed');
+          const found = await pwaHistory.search(event.privateIdentity.userId, historyRequest);
+          await assertReplyCurrent();
+          rawHistoryContext = formatPwaHistoryEvidence(found, historyRequest);
+          event.pwaHistoryRefs = [...(event.pwaHistoryRefs || []), ...(found.records || []).map(record => ({ id: record.id, fingerprint: pwaHistoryFingerprint(record) }))];
+          expanded = { ...recalled, hasNewEvidence: true };
+        } else expanded = await unifiedMemory.recall({ ...recallOptions, limit: 20, expanded: true, previous: recalled });
+        await assertReplyCurrent();
+        // Repeating the same context is not a successful history expansion.
+        if (action !== 'history_search' && (!expanded.hasNewEvidence || expanded.context === recalled.context)) {
+          baseReply = '这句的前文我没接上，你指的是哪一段？';
+          event.skipExchangeMemory = true;
+          break;
+        }
+        recalled = expanded;
+        if (structuredRetrievalReply) publicTopics = await prepareChatPublicTopics({
+          text: [text, quotedContext, recalled.context].filter(Boolean).join('\n'), explicitText: text,
+          signal: event.replyTurn?.signal, assertCurrent: assertReplyCurrent });
+        nextPurpose = 'qq-context-expansion';
+      } catch (caught) {
+        if (['REPLY_SUPERSEDED','MEMORY_EPOCH_CHANGED','HISTORY_SOURCE_CHANGED'].includes(caught.code) || event.replyTurn?.signal.aborted) throw caught;
+        baseReply = '这次没能补查到前文，你指的是哪一段？';
+        event.skipExchangeMemory = true;
+        break;
+      }
+    } else if (action === 'lookup') {
+      lookupUsed = true;
+      if (record?.decision) record.decision.status = '查询公开资料';
+      await assertReplyCurrent();
+      const result = await retrieveChatEvidence({
+        request: { version: 1, id: crypto.randomUUID(), turnId: id,
+          scope: { kind: 'private', contactId: memoryScope(event), memoryEpoch: event.memoryEpochToken?.epoch },
+          publicQuery: lifeDecision.lookup },
+        topics: publicTopics, signal: event.replyTurn?.signal, assertCurrent: assertReplyCurrent
+      });
+      await assertReplyCurrent();
+      webResults.push(result);
+      webContext = webResults.map(formatRetrievalEvidence).join('\n');
+      event.chatEvidenceValidity = async () => { for (const evidence of webResults) await chatRetrieval.assertResultCurrent(evidence); };
+      publicTopics = webResults.length === 1 ? await chatRetrieval.pageLinkTopics(result) : [];
+      followingPage = publicTopics.length > 0;
+      // Only aggregate, non-content diagnostics enter the event/observer.
+      event.chatRetrieval = { status: result.status, cacheHit: result.cacheHit, metrics: result.metrics };
+      state.maintenance.webLookup.lastQuery = null;
+      state.maintenance.webLookup.lastRunAt = new Date().toISOString();
+      state.maintenance.webLookup.lastOk = ['ok', 'partial'].includes(result.status);
+      state.maintenance.webLookup.lastError = result.errorCode || null;
+      state.maintenance.webLookup.lastDurationMs = result.metrics?.http?.durationMs ?? result.metrics?.durationMs ?? null;
+      nextPurpose = 'qq-chat-lookup';
     }
   }
-  if (shouldRequestExpandedQqContext(stripMoodMarkers(baseReply))) {
+  throwIfReplySuperseded(event);
+  await assertMemoryCurrent();
+  if (!await readingNotesCurrent(event.noteRefs, { scope: memoryScope(event), epochToken: event.memoryEpochToken })) {
+    throw Object.assign(Error('Reading note source changed'), { code: 'NOTE_SOURCE_CHANGED' });
+  }
+  if (shouldRequestExpandedPrivateContext(stripMoodMarkers(baseReply)) || parsePwaHistoryRequest(stripMoodMarkers(baseReply))) {
     baseReply = '这句的前文我没接上，你指的是哪一段？';
     event.skipExchangeMemory = true;
   }
@@ -1675,480 +1917,169 @@ async function buildModelReply(event) {
     const { kind, quote } = lifeDecision.contactBoundary;
     if (ownContactEvidence(boundaryEvidence.event).some(line => line.includes(quote))
       && (kind !== 'resume' || isExplicitContactInvitation(boundaryEvidence.event, quote))) {
-      await lifeContacts.applyDecision({ token: boundaryEvidence.token, event: boundaryEvidence.event,
+      const applied = await unifiedMemory.withEpoch(event.memoryEpochToken, () => lifeContacts.applyDecision({ token: boundaryEvidence.token, event: boundaryEvidence.event,
         decision: { action: kind, basis: kind === 'pause' ? 'contextual-impatience' : 'explicit-invitation',
-          evidence: quote, reason: kind === 'pause' ? 'same-turn-contextual-impatience' : 'same-turn-explicit-invitation' } });
+          evidence: quote, reason: kind === 'pause' ? 'same-turn-contextual-impatience' : 'same-turn-explicit-invitation' } }));
+      if (applied?.reason === 'memory-epoch-changed') await assertMemoryCurrent();
     }
     if (kind === 'pause' && !lifeContacts.isCurrent(event.lifeContactToken)) return '';
   }
   if (structuredLifeReply && !isCurrentLifeReply(event)) return '';
+  throwIfReplySuperseded(event);
+  if (lifeDecision?.creativeWork && !event.skipExchangeMemory) {
+    baseReply = await makePrivateWork(event, workBinding, lifeDecision.creativeWork, assertReplyCurrent);
+  }
+  if (!event.skipExchangeMemory && browseIntentsAvailable()) event.lifeBrowseIntent = lifeDecision?.browseIntent || null;
   baseReply = moodState.finalize(baseReply, event);
-  const reply = state.qq.enhancer.enabled
-    ? encourageQqStickerReply(
+  const reply = state.privateChat.enhancer.enabled
+    ? encourageStickerReply(
       baseReply,
       event,
       stickerCatalog
     )
     : baseReply;
   if (!reply) return buildAssistantReply(event);
-  return reply.slice(0, 900);
+  event.learningModelReply = !event.skipExchangeMemory;
+  if (allowPrivateThought && event.learningModelReply && lifeDecision?.privateThought && reply.length <= 900) event.privateThought = lifeDecision.privateThought;
+  if (replySettings.mode === 'two-stage' && stripMoodMarkers(reply).replace(/\[\[qq_sticker:[^\]]+\]\]/g, '').trim().length > 900) throw Error('Writer reply exceeds complete-text limit');
+  return replySettings.mode === 'two-stage' ? reply : reply.slice(0, 900);
 }
 
-function shouldRequestExpandedQqContext(reply) {
+
+async function runReplyRole({ role, prompt, schema, caller, event, assertCurrent, imagePaths = [], deadline = Infinity }) {
+  const route = role === 'writer' ? resolveReplyWriter(replySettings, caller) : caller;
+  return backgroundTask(runtimeBudget.run({ purpose: `private-reply-${role}` }, () => measureModelCall(async () => {
+    await assertCurrent();
+    const remaining = Math.min(300000, deadline - Date.now());
+    if (remaining < 100 || event?.replyTurn?.signal.aborted) throw Object.assign(Error('Reply expired'), { code: 'REPLY_SUPERSEDED' });
+    const runner = createWorldModel({ directory: join(projectDir, 'runtime', `private-reply-${role}`),
+      model: route.model === 'default' ? undefined : route.model, reasoningEffort: route.reasoningEffort,
+      proxy: localConfig.codexProxy, schema, timeoutMs: remaining });
+    const result = await runner({ prompt, imagePaths, signal: event?.replyTurn?.signal });
+    try {
+      await assertCurrent();
+      if (Date.now() >= deadline) throw Object.assign(Error('Reply expired'), { code: 'REPLY_SUPERSEDED' });
+      return result;
+    } catch (error) { error.usage ??= result.usage ?? null; throw error; }
+  })));
+}
+
+async function prepareChatPublicTopics({ text, explicitText = '', signal, assertCurrent }) {
+  await assertCurrent();
+  const catalog = publicTopicCatalog.peekTopics();
+  if (signal?.aborted) throw Object.assign(Error('Reply superseded'), { code: 'REPLY_SUPERSEDED' });
+  await assertCurrent();
+  return approvePublicTopics({ text, explicitText, ...(catalog ? { catalog } : {}) });
+}
+
+async function retrieveChatEvidence(options) {
+  // Refresh public vocabulary only as part of an actual lookup, and drain
+  // both tasks even when a stale scope or cancellation makes one reject.
+  const [retrieved] = await Promise.allSettled([
+    chatRetrieval.retrieve(options), publicTopicCatalog.getTopics({ signal: options.signal })
+  ]);
+  await options.assertCurrent();
+  if (retrieved.status === 'rejected') throw retrieved.reason;
+  return retrieved.value;
+}
+
+// D-on uses the same tightly restricted model runner as read-only decisions.
+async function generateControlledChatReply(_args, prompt, options, event) {
+  const caller = { model: localConfig.privateChatModel || state.ai.model,
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort };
+  const route = resolveReplyWriter(replySettings, caller);
+  return backgroundTask(runtimeBudget.run({ purpose: options.budgetPurpose }, () => measureModelCall(() =>
+    withCurrentReplySignal(options.beforeRun, async ({ signal, assertCurrent }) => {
+    await assertCurrent();
+    const runner = createWorldModel({ directory: join(projectDir, 'runtime', 'chat-decision-model'),
+      model: route.model === 'default' ? undefined : route.model, reasoningEffort: route.reasoningEffort,
+      proxy: localConfig.codexProxy, schema: withCreativeSchema(withPrivateThoughtSchema(chatReplyDecisionSchema, event.privateReplyContext), event.privateReplyContext.creativeKinds), timeoutMs: 300000 });
+    const result = await runner({ prompt, imagePaths: event.imagePaths || [], signal });
+    try { await assertCurrent(); return { replyText: result.text, usage: result.usage }; }
+    catch (error) { error.usage ??= result.usage ?? null; throw error; }
+  }))));
+}
+
+async function generatePrivateReply(args, prompt, options, event) {
+  if (replySettings.mode !== 'two-stage') return runCodexCli(args, prompt, options);
+  const context = event.privateReplyContext;
+  const assertCurrent = async () => {
+    throwIfReplySuperseded(event); personaPolicy?.assertCurrent(event.personaToken);
+    await options.beforeRun?.();
+    if (event.learningValidity && !await event.learningValidity()) throw Error('Learned source changed');
+    if (!event.hubPreview && event.lifeContactToken && !isCurrentLifeReply(event)) throw Object.assign(Error('Reply superseded'), { code: 'REPLY_SUPERSEDED' });
+    if (!await readingNotesCurrent(event.noteRefs, { scope: memoryScope(event), epochToken: event.memoryEpochToken })) throw Error('Reading source changed');
+    throwIfReplySuperseded(event); personaPolicy?.assertCurrent(event.personaToken);
+  };
+  const caller = { model: localConfig.privateChatModel || state.ai.model,
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort };
+  const result = await runReplyRole({ role: 'planner', prompt: prompt + '\n\n' + replyPlanPrompt(context) + (context.plainText ? '\n本轮是忙后纯文字补答，presentation两项必须为null；不再补查。' : ''),
+    schema: replyPlanSchema(context), caller, event, assertCurrent, imagePaths: event.imagePaths });
+  const plan = parseReplyPlan(result.text, context);
+  let text = '';
+  if (plan.utterance) {
+    // A semantic plan and explicit local eligibility are both required. Missing
+    // certainty leaves variations off; a retry reuses the logical turn seed.
+    const variant = selectReplyVariant({ plan, entry: event.lifeResumeContext ? 'busy' : 'ordinary',
+      turnId: context.turnId, seed: context.turnId, enabled: replySettings.styleProbability > 0,
+      probability: replySettings.styleProbability, translationEnabled: replySettings.translationStyle,
+      localContext: event.expressionEligibility || {
+        command: event.backendCommand === true || /^\s*\//.test(event.text || ''),
+        toolResult: Boolean(event.hubPreview || event.chatRetrieval || context.evidence.some(row => ['web', 'desktop'].includes(row.kind))),
+        serious: plan.utterance.contextKind !== 'casual', distress: plan.utterance.contextKind !== 'casual',
+        conflict: plan.utterance.contextKind !== 'casual', boundary: plan.control.contactBoundary?.kind !== 'none' && Boolean(plan.control.contactBoundary),
+        playfulContext: false, sharedTranslationJoke: false
+      } });
+    event.replyStyleVariant = variant?.id || null;
+    const writer = await runReplyRole({ role: 'writer', prompt: buildWriterPrompt({ ...context, plan, variant }),
+      schema: writerReplySchema, caller, event, assertCurrent, imagePaths: event.imagePaths });
+    text = parseWriterReply(writer.text, { maxChars: 900, requiredLiterals: plan.utterance.requiredLiterals }).text;
+  }
+  await assertCurrent();
+  const assembled = assembleReply(plan, text, context);
+  return { replyText: typeof assembled === 'string' ? assembled : JSON.stringify(assembled) };
+}
+
+function shouldRequestExpandedPrivateContext(reply) {
   return String(reply || "").includes("[[qq_context_more]]");
 }
 
-function encourageQqStickerReply(reply, event, stickerCatalog) {
+function encourageStickerReply(reply, event, stickerCatalog) {
   return ensureStickerLeadText(reply);
 }
 
-function isLowStickerValueReply(reply, event) {
-  return false;
-}
-
-function shouldAutoAttachQqSticker(source, event) {
-  return false;
-}
-
-function chooseQqStickerName(text, stickerCatalog) {
-  const ranked = rankStickerNamesByText(text, stickerCatalog);
-  if (ranked[0]?.score >= 5) {
-    const top = ranked.filter((item) => item.score >= Math.max(5, ranked[0].score - 2)).slice(0, 5);
-    return top[stableModuloLocal(`${text}:${ranked[0].name}`, top.length)]?.name || ranked[0].name;
-  }
-
-  const rules = [
-    // Deployment customization point:
-    // Add rules such as { pattern: /keyword/, names: ["sticker name"] } after
-    // adding your own public sticker library.
-  ];
-
-  for (const rule of rules) {
-    if (!rule.pattern.test(text)) continue;
-    const found = findAvailableStickerName(stickerCatalog, rule.names);
-    if (found) return found;
-  }
-  return "";
-}
-
-function rankStickerNamesByText(text, stickerCatalog) {
-  const normalizedText = normalizeSemanticText(text);
-  return (stickerCatalog || [])
-    .map((item) => ({
-      name: item.name,
-      score: scoreStickerNameAgainstText(item.name, normalizedText)
-    }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, "zh-Hans-CN"));
-}
-
-function scoreStickerNameAgainstText(name, normalizedText) {
-  const normalizedName = normalizeSemanticText(name);
-  if (!normalizedName || !normalizedText) return 0;
-  let score = 0;
-  if (normalizedText.includes(normalizedName)) score += 30;
-  for (const chunk of meaningfulChunks(normalizedName)) {
-    if (normalizedText.includes(chunk)) score += chunk.length >= 3 ? 5 : 3;
-  }
-  for (const gram of charGrams(normalizedName, 2)) {
-    if (normalizedText.includes(gram)) score += 1;
-  }
-  const boosts = [
-    // Deployment customization point:
-    // Add semantic boost pairs here if you want filename-based sticker ranking.
-  ];
-  for (const [textPattern, namePattern] of boosts) {
-    if (textPattern.test(normalizedText) && namePattern.test(normalizedName)) score += 8;
-  }
-  return score;
-}
-
-function meaningfulChunks(text) {
-  return String(text || "")
-    .split(/[^一-龥A-Za-z0-9]+/)
-    .flatMap((part) => {
-      if ([...part].length <= 4) return [part];
-      const chunks = [];
-      for (let size = 4; size >= 2; size -= 1) {
-        for (let index = 0; index <= [...part].length - size; index += size) {
-          chunks.push([...part].slice(index, index + size).join(""));
-        }
-      }
-      return chunks;
-    })
-    .filter((chunk) => [...chunk].length >= 2 && !/^(这个|那个|我们|你们|他们|就是|然后|可以|非常|已经|现在)$/.test(chunk));
-}
-
-function charGrams(text, size) {
-  const chars = [...String(text || "")];
-  const grams = [];
-  for (let index = 0; index <= chars.length - size; index += 1) {
-    grams.push(chars.slice(index, index + size).join(""));
-  }
-  return grams;
-}
-
-function normalizeSemanticText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\[\[qq_(?:sticker|image):[^\]]+\]\]/g, "")
-    .replace(/\[cq:[^\]]+\]/gi, "")
-    .replace(/[^\p{Script=Han}A-Za-z0-9]+/gu, "")
-    .trim();
-}
-
-function findAvailableStickerName(stickerCatalog, names) {
-  for (const name of names) {
-    const found = stickerCatalog.find((item) => item.name === name);
-    if (found) return found.name;
-  }
-  return "";
-}
-
-function stableModuloLocal(seed, modulo) {
-  let hash = 0;
-  for (const char of String(seed || "")) {
-    hash = (hash * 31 + char.codePointAt(0)) >>> 0;
-  }
-  return modulo > 0 ? hash % modulo : 0;
-}
-
-async function buildWebLookupContext(event) {
-  const text = stripMentionText(event.text);
-  if (!shouldUseWebLookup(event, text)) return "";
-  const query = buildWebLookupQuery(text);
-  try {
-    const results = await searchWeb(query);
-    if (results.length === 0) return "";
-    return [
-      "联网查询摘要：",
-      "以下是 Hub 为这个 QQ 私聊问题临时查询到的网页搜索摘要。只在相关时参考；不要编造未查到的细节；如果结果不可靠，可以说不确定。",
-      ...results.map((result, index) => [
-        `${index + 1}. ${result.title}`,
-        result.snippet ? `摘要：${result.snippet}` : null,
-        result.url ? `链接：${result.url}` : null
-      ].filter(Boolean).join("\n"))
-    ].join("\n");
-  } catch (error) {
-    return [
-      "联网查询摘要：",
-      `这次联网查询失败：${error.message}。如果问题依赖最新资料或陌生定义，请简短说明现在查不到。`
-    ].join("\n");
-  }
-}
-
-function shouldUseWebLookup(event, text) {
-  const normalized = String(text || "").trim();
-  if (!state.qq.webLookup.enabled || !normalized) return false;
-  if (isFilesystemProbe(normalized)) return false;
-  if (/(是什么意思|什么意思|啥意思|什么梗|啥梗|什么定义|定义|是谁|谁是|是什么东西|是什么|百科|查一下|搜一下|网上|最近|最新|新闻|出处|来源)/i.test(normalized)) return true;
-  if (/(最好|最好用|推荐|排行|排名|强度|攻略|通关|配装|卡牌|角色|装备|技能|流派|打法|弱点|结局|路线|隐藏|解锁|mod|MOD|版本|补丁)/i.test(normalized)
-    && /(游戏|手游|Steam|steam|Switch|switch|主机|东方|虹龙洞|原神|崩铁|明日方舟|碧蓝|gal|galgame|GameCube|GC|任天堂|索尼|Xbox|xbox|卡牌|角色|装备|关卡)/i.test(normalized)) {
-    return true;
-  }
-  if (/(哪[个些]|几个|多少|为什么|怎么|如何|能不能|可以吗|对不对|是不是|有没有|靠谱吗|厉害吗|强吗)/.test(normalized)
-    && /[A-Za-z0-9]{3,}|[·《》]|东方|虹龙洞|游戏|手游|番|角色|卡牌|装备|模型|软件|项目|插件|版本|系统|硬件|显卡|驱动/.test(normalized)) {
-    return true;
-  }
-  return false;
-}
-
-function buildWebLookupQuery(text) {
-  return String(text || "").trim();
-}
-
-function shouldInspectQqImages(event, text) {
-  // The response gate already decided to call the model. Include the images
-  // for that reply even when a sticker has no accompanying text.
-  return hasAnyQqImageReference(event);
-}
-
-function getQqModelImageInputs(event, text) {
-  if (!shouldInspectQqImages(event, text)) return [];
-  const currentImages = Array.isArray(event.images) ? event.images : [];
-  const quotedImages = Array.isArray(event.replyContext?.images) ? event.replyContext.images : [];
-  if (currentImages.length > 0) return currentImages;
-  if (quotedImages.length > 0) return quotedImages;
-  return [];
-}
-
-function hasAnyQqImageReference(event) {
+function hasAnyPrivateImageReference(event) {
   return (Array.isArray(event.images) && event.images.length > 0)
     || (Array.isArray(event.replyContext?.images) && event.replyContext.images.length > 0);
 }
 
-function isQqImageLookRequest(text) {
+function isPrivateImageLookRequest(text) {
   return /(看图|看一下图|看看图|这图|这个图|这张|图片|截图|表情包|图里|图上|什么图|配图|识别|看得懂|看不懂|何意味|逆天|抽象|离谱|绷不住|典中典|味太冲|评价一下|锐评|说说|怎么看|看法)/i.test(String(text || ""));
 }
 
-async function searchWeb(query) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), qqWebLookupTimeoutMs);
-  const startedAt = Date.now();
-  state.maintenance.webLookup.lastQuery = query;
-  state.maintenance.webLookup.lastRunAt = new Date().toISOString();
-  try {
-    const queryVariants = buildWebQueryVariants(query);
-    const wikipediaResults = [];
-    const webResults = [];
-    const preferredProvider = chooseWebSearchProvider();
-    state.maintenance.webLookup.effectiveProvider = preferredProvider;
-
-    if (shouldUseWikipediaForQuery(query)) {
-      for (const variant of queryVariants.slice(0, 2)) {
-        const hits = await searchWikipedia(variant, controller.signal).catch(() => []);
-        wikipediaResults.push(...hits);
-        if (wikipediaResults.length >= 2) break;
-      }
-    }
-
-    await collectSearchProviderResults(preferredProvider, queryVariants, controller.signal, webResults);
-    const results = mergeSearchResults([...wikipediaResults, ...webResults]).slice(0, 5);
-    const enriched = await enrichWebResults(results);
-    state.maintenance.webLookup.lastOk = true;
-    state.maintenance.webLookup.lastError = null;
-    state.maintenance.webLookup.lastDurationMs = Date.now() - startedAt;
-    return enriched;
-  } catch (error) {
-    state.maintenance.webLookup.lastOk = false;
-    state.maintenance.webLookup.lastError = error.message;
-    state.maintenance.webLookup.lastDurationMs = Date.now() - startedAt;
-    if (error.name === "AbortError") throw new Error("search timed out");
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function chooseWebSearchProvider() {
-  if (qqWebSearchProvider === "duckduckgo" || qqWebSearchProvider === "ddg") return "duckduckgo";
-  return "duckduckgo";
-}
-
-async function collectSearchProviderResults(provider, queryVariants, signal, output) {
-  state.maintenance.webLookup.effectiveProvider = provider;
-  for (const variant of queryVariants.slice(0, 4)) {
-    const hits = await searchDuckDuckGo(variant, signal);
-    output.push(...hits);
-    if (output.length >= 5) return;
-  }
-}
-
-function buildWebQueryVariants(query) {
-  const raw = String(query || "").trim();
-  if (!raw) return [];
-  const stripped = stripSearchLeadWords(raw);
-  const base = stripQuestionTail(stripped);
-  const variants = [
-    raw,
-    stripped,
-    base,
-    isTimeSensitiveWebQuery(raw) ? `${base} 最新` : "",
-    /(攻略|配装|打法|角色|装备|技能|流派|版本|补丁)/i.test(raw) ? `${base} 攻略` : "",
-    /(是什么|什么意思|什么梗|定义|出处|来源)/i.test(raw) ? `${base} 解释` : "",
-    /(谁是|是谁)/i.test(raw) ? `${base} wiki` : ""
-  ];
-  return [...new Set(variants.map((item) => item.trim()).filter(Boolean))].slice(0, 5);
-}
-
-function shouldUseWikipediaForQuery(query) {
-  return isDefinitionStyleQuery(query);
-}
-
-function isDefinitionStyleQuery(query) {
-  return /(是什么意思|什么意思|啥意思|什么梗|啥梗|定义|百科|出处|来源|是什么)/i.test(String(query || ""));
-}
-
-function stripSearchLeadWords(query) {
-  return String(query || "")
-    .replace(/^(查一下|搜一下|帮我查一下|帮我搜一下|网上查一下|网上搜一下|给我查一下|给我搜一下|你查一下|你搜一下)\s*/i, "")
-    .trim();
-}
-
-function stripQuestionTail(query) {
-  return String(query || "")
-    .replace(/[？?。！!，,：:]+$/g, "")
-    .replace(/(是什么意思|什么意思|啥意思|什么梗|啥梗|是什么梗|什么定义|的定义是什么|定义是什么|是什么东西|是什么|是谁|谁是|出处是什么|来源是什么|最近怎么样|最新消息)$/i, "")
-    .trim() || String(query || "").trim();
-}
-
-function isTimeSensitiveWebQuery(text) {
-  return /(最近|最新|现在|今天|本周|本月|版本|补丁|更新|新闻|热搜|刚出|新出的|什么时候上线|什么时候更新)/i.test(String(text || ""));
-}
-
-async function searchWikipedia(query, signal) {
-  const wikipediaQuery = buildWikipediaQuery(query);
-  const titles = await searchWikipediaTitles(wikipediaQuery, signal, "zh");
-  const fallbackTitles = titles.length > 0 ? [] : await searchWikipediaTitles(query, signal, "en");
-  const candidates = [...titles, ...fallbackTitles].slice(0, 2);
-  const results = [];
-  for (const candidate of candidates) {
-    const summary = await fetchWikipediaSummary(candidate.title, signal, candidate.lang).catch(() => null);
-    if (summary?.title) results.push(summary);
-  }
-  return results;
-}
-
-function buildWikipediaQuery(query) {
-  return stripMentionText(query)
-    .replace(/[？?。！!，,：:]+$/g, "")
-    .trim()
-    .replace(/^(查一下|搜一下|百科一下|百科|网上查一下|帮我查一下)\s*/, "")
-    .replace(/^谁是\s*/, "")
-    .replace(/(是什么意思|什么意思|啥意思|什么梗|啥梗|是什么梗|什么定义|的定义是什么|定义是什么|是什么东西|是什么|是谁|谁是|出处是什么|来源是什么|最近怎么样|最新消息)$/i, "")
-    .trim() || String(query || "").trim();
-}
-
-async function searchWikipediaTitles(query, signal, lang) {
-  const url = `https://${lang}.wikipedia.org/w/api.php?action=opensearch&search=${encodeURIComponent(query)}&limit=3&namespace=0&format=json&origin=*`;
-  const response = await fetch(url, {
-    signal,
-    headers: { "user-agent": userAgentName }
-  });
-  if (!response.ok) return [];
-  const data = await response.json();
-  const titles = Array.isArray(data?.[1]) ? data[1] : [];
-  return titles.map((title) => ({ title, lang }));
-}
-
-async function fetchWikipediaSummary(title, signal, lang) {
-  const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`;
-  const response = await fetch(url, {
-    signal,
-    headers: { "user-agent": userAgentName }
-  });
-  if (!response.ok) return null;
-  const data = await response.json();
-  if (data.type === "disambiguation" && !data.extract) return null;
-  return {
-    title: `Wikipedia：${data.title || title}`,
-    url: data.content_urls?.desktop?.page || `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title)}`,
-    snippet: data.extract || "",
-    source: "wikipedia"
-  };
-}
-
-async function searchDuckDuckGo(query, signal) {
-  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const response = await fetch(url, {
-    signal,
-    headers: {
-      "user-agent": userAgentName
-    }
-  });
-  if (!response.ok) throw new Error(`search returned HTTP ${response.status}`);
-  return parseDuckDuckGoResults(await response.text()).slice(0, 3);
-}
-
-function mergeSearchResults(results) {
-  const seen = new Set();
-  return results.filter((result) => {
-    const key = result.url || result.title;
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
-async function enrichWebResults(results) {
-  const enriched = [];
-  for (const result of results) {
-    if (!result.snippet && result.source !== "wikipedia" && enriched.length < 2 && result.url) {
-      enriched.push({
-        ...result,
-        snippet: await fetchPageSnippet(result.url).catch(() => "")
-      });
-    } else {
-      enriched.push(result);
-    }
-  }
-  return enriched;
-}
-
-async function fetchPageSnippet(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.min(3500, qqWebLookupTimeoutMs));
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: { "user-agent": userAgentName }
-    });
-    if (!response.ok) return "";
-    const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/html")) return "";
-    const text = htmlToPlainText(await response.text());
-    return text.slice(0, 420);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function htmlToPlainText(html) {
-  return cleanHtml(String(html || "")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " "));
-}
-
-function parseDuckDuckGoResults(html) {
-  return String(html || "")
-    .split(/<div class="result(?: result--ad)?/g)
-    .map((block) => {
-      const titleMatch = block.match(/<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/);
-      if (!titleMatch) return null;
-      const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div)>/);
-      return {
-        title: cleanHtml(titleMatch[2]),
-        url: normalizeDuckDuckGoUrl(htmlDecode(titleMatch[1])),
-        snippet: snippetMatch ? cleanHtml(snippetMatch[1]) : ""
-      };
-    })
-    .filter((result) => result?.title)
-    .filter((result, index, list) => list.findIndex((item) => item.url === result.url) === index);
-}
-
-function cleanHtml(value) {
-  return htmlDecode(String(value || "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim());
-}
-
-function htmlDecode(value) {
-  return String(value || "")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, "\"")
-    .replace(/&#39;/g, "'")
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, num) => String.fromCodePoint(Number(num)));
-}
-
-function normalizeDuckDuckGoUrl(url) {
-  try {
-    const parsed = new URL(url, "https://duckduckgo.com");
-    const redirected = parsed.searchParams.get("uddg");
-    return redirected ? decodeURIComponent(redirected) : parsed.href;
-  } catch {
-    return url;
-  }
-}
-
 function isPrivateMemoryEvent(event) {
-  return event?.type === 'private_message' && event.groupId == null && event.raw?.group_id == null
-    && /^[1-9]\d*$/.test(String(event.senderId || ''));
+  if (!isPwaEvent(event) || event.type !== 'private_message' || event.groupId != null || event.raw?.group_id != null) return false;
+  try { return isPrivateScope(privateEventScope(event)); } catch { return false; }
 }
 
-async function rememberQqExchange(event, reply) {
+async function rememberPrivateExchange(event, reply) {
   if (!isPrivateMemoryEvent(event) || !reply || event.skipExchangeMemory
-    || /^\s*\//.test(event.text || '')) return;
-  await unifiedMemory.writeExchange({ scope: memoryScope(event),
+    || event.backendCommand === true) return { ok: true, skipped: true, reason: 'not-conversation-memory' };
+  const saved = await unifiedMemory.writeExchange({ scope: memoryScope(event),
     senderLabel: event.senderLabel || String(event.senderId),
     userText: stripMentionText(event.text || ''), replyText: String(reply),
     messageId: event.raw?.message_id, replyMessageId: event.replyMessageId,
     sentMessageIds: event.sentMessageIds || [],
+    ...(isPwaEvent(event) ? { deliveryId: event.pwaLogicalReplyId, channel: 'pwa' } : {}),
+    epochToken: event.memoryEpochToken,
+    learningEligible: event.learningConversation === true && event.learningModelReply === true,
     quotedText: event.replyContext?.scopeVerified ? event.replyContext.text || '' : '' });
+  if (saved?.ok && event.learningConversation && event.learningModelReply && (!isPwaEvent(event) || pwaWritable())) {
+    // Scheduling is optional and must never turn a delivered reply into a failure.
+    void Promise.resolve(privateLearning?.noteExchange({ scope: memoryScope(event) }))
+      .catch(() => console.error('Could not schedule optional private learning'));
+  }
+  return saved;
 }
 
 function sqliteJson(query) {
@@ -2634,8 +2565,6 @@ async function executeIMessageCommand(text, event = null) {
       "/状态",
       "/私聊模型 模型名",
       "/私聊智能等级 low|medium|high|xhigh",
-      "/QQ模型 模型名",
-      "/QQ智能等级 low|medium|high|xhigh",
       "/额度",
       "/刷新额度",
       "/启动Codex",
@@ -2646,8 +2575,6 @@ async function executeIMessageCommand(text, event = null) {
       "/交接",
       "/统一记忆状态",
       "/清除统一记忆",
-      "/开启QQ",
-      "/关闭QQ",
       "/开启iMessage",
       "/关闭iMessage",
       "/清除记忆",
@@ -2670,14 +2597,6 @@ async function executeIMessageCommand(text, event = null) {
       "/帮助"
     ].join("\n") };
   }
-  if (/(开启|打开|启动)qq/.test(normalized)) {
-    state.channels.qq = true;
-    return { ok: true, summary: "QQ channel enabled", reply: "QQ 已开启。" };
-  }
-  if (/(关闭|关掉|切断|停止).*(qq|监听qq)/.test(normalized) || /(qq|监听qq).*(关闭|关掉|切断|停止)/.test(normalized)) {
-    state.channels.qq = false;
-    return { ok: true, summary: "QQ channel disabled", reply: "QQ 已关闭。" };
-  }
   if (/(开启|打开|启动)(imessage|信息|短信)/.test(normalized)) {
     state.channels.imessage = true;
     updateIMessagePoller();
@@ -2690,17 +2609,17 @@ async function executeIMessageCommand(text, event = null) {
   }
   if (/^(状态|status|查看状态)$/.test(normalized)) {
     const reply = [
-      `QQ：${state.channels.qq ? "开启" : "关闭"}`,
-      `QQ 模型：${state.ai.model} / ${state.ai.reasoningEffort}`,
+      `网页：${state.channels.pwa ? "开启" : "关闭"}`,
+      `默认模型：${state.ai.model} / ${state.ai.reasoningEffort}`,
       `iMessage：${state.channels.imessage ? "开启" : "关闭"}`,
       `iMessage 私聊模型：${state.ai.imessageModel} / ${state.ai.imessageReasoningEffort}`,
-      `ban 用户：${state.qq.bannedUserIds.length} 个`,
+
       `iMessage 记忆：${Object.keys(state.imessage.memory.entries).length} 个联系人`,
       `远程执行模式：${state.remoteExecution.enabled ? "开启" : "关闭"}`
     ].join("\n");
     return {
       ok: true,
-      summary: `QQ=${state.channels.qq ? "on" : "off"}, iMessage=${state.channels.imessage ? "on" : "off"}`,
+      summary: `PWA=${state.channels.pwa ? "on" : "off"}, iMessage=${state.channels.imessage ? "on" : "off"}`,
       reply
     };
   }
@@ -2729,23 +2648,6 @@ async function executeIMessageCommand(text, event = null) {
     await saveSettings();
     return { ok: true, summary: `iMessage effort set to ${effort}`, reply: `iMessage 私聊智能等级已切换：${effort}` };
   }
-  const qqModelMatch = command.match(/^qq模型\s+(.+)$/i);
-  if (qqModelMatch) {
-    const model = qqModelMatch[1].trim();
-    if (!/^[A-Za-z0-9._:-]+$/.test(model)) {
-      return { ok: false, summary: "Invalid QQ model", reply: "这个 QQ 模型名看起来不太对，只接受字母、数字、点、横线、下划线和冒号。" };
-    }
-    state.ai.model = model;
-    await saveSettings();
-    return { ok: true, summary: `QQ model set to ${model}`, reply: `QQ 通道模型已切换：${model}` };
-  }
-  const qqEffortMatch = command.match(/^qq(?:智能等级|智能|思考强度)\s+(low|medium|high|xhigh|低|中|高|最高)$/i);
-  if (qqEffortMatch) {
-    const effort = normalizeReasoningEffort(qqEffortMatch[1]);
-    state.ai.reasoningEffort = effort;
-    await saveSettings();
-    return { ok: true, summary: `QQ effort set to ${effort}`, reply: `QQ 通道智能等级已切换：${effort}` };
-  }
   if (/^(刷新额度|强刷额度|刷新配额|强刷配额)$/.test(normalized)) {
     const quota = await readLatestCodexQuotaSnapshot();
     state.maintenance.codex.quota = quota;
@@ -2768,14 +2670,12 @@ async function executeIMessageCommand(text, event = null) {
     const health = await buildMaintenanceStatus();
     const proxy = await getProxyStatus();
     const reply = [
-      `LLBot：${health.oneBot.ok ? "在线" : "离线"}`,
       `Codex：${health.codex.pathExists ? "路径正常" : "路径缺失"}${health.codex.lastDurationMs != null ? `，上次 ${health.codex.lastDurationMs}ms` : ""}`,
       formatCodexQuotaSummary(health.codex.quota),
-      `QQ：${health.channels.qq ? "开启" : "关闭"}，事件 ${health.qq.recentEvents} 条`,
+      `网页：${health.channels.pwa ? "开启" : "关闭"}，事件 ${health.privateChat.recentEvents} 条`,
       `iMessage：${health.channels.imessage ? "开启" : "关闭"}，${health.imessage.status}`,
       `代理：${formatProxyStatus(proxy)}`,
       `联网查询：${health.webLookup.enabled ? "开启" : "关闭"}${health.webLookup.lastDurationMs != null ? `，上次 ${health.webLookup.lastDurationMs}ms` : ""}`,
-      health.oneBot.lastError ? `LLBot 错误：${health.oneBot.lastError}` : null,
       health.codex.lastError ? `Codex 错误：${health.codex.lastError.slice(0, 120)}` : null,
       health.webLookup.lastError ? `联网错误：${health.webLookup.lastError}` : null,
       health.imessage.lastError ? `iMessage 错误：${health.imessage.lastError}` : null
@@ -2790,14 +2690,15 @@ async function executeIMessageCommand(text, event = null) {
     return { ok: true, summary: "iMessage memory cleared", reply: "iMessage 私聊记忆已清除。" };
   }
   if (/^(联网开|开启联网|打开联网|联网查询开)$/.test(normalized)) {
-    state.qq.webLookup.enabled = true;
+    state.privateChat.webLookup.enabled = true;
     state.maintenance.webLookup.enabled = true;
-    return { ok: true, summary: "QQ web lookup enabled", reply: "QQ 联网查询已开启。" };
+    return { ok: true, summary: "Private web lookup enabled", reply: "私聊联网查询已开启。" };
   }
   if (/^(联网关|关闭联网|关掉联网|联网查询关)$/.test(normalized)) {
-    state.qq.webLookup.enabled = false;
+    state.privateChat.webLookup.enabled = false;
     state.maintenance.webLookup.enabled = false;
-    return { ok: true, summary: "QQ web lookup disabled", reply: "QQ 联网查询已关闭。" };
+    privateThoughtActions?.invalidate();
+    return { ok: true, summary: "Private web lookup disabled", reply: "私聊联网查询已关闭。" };
   }
   if (/^(代理状态|vpn状态|shadowrocket状态)$/.test(normalized)) {
     const proxy = await getProxyStatus();
@@ -2883,7 +2784,7 @@ async function executeIMessageCommand(text, event = null) {
     }
     return executePendingProxyAction();
   }
-  return { ok: false, summary: "Unknown command", reply: "没认出这个指令。可用：/状态、/额度、/刷新额度、/启动Codex、/前台Codex、/退出Codex、/维护、/记忆、/交接、/开启QQ、/关闭QQ、/清除记忆、/代理状态、/代理开、/代理关、/联网开、/联网关、/休眠、/帮助。" };
+  return { ok: false, summary: "Unknown command", reply: "没认出这个指令。可用：/状态、/额度、/刷新额度、/启动Codex、/前台Codex、/退出Codex、/维护、/记忆、/交接、/清除记忆、/代理状态、/代理开、/代理关、/联网开、/联网关、/休眠、/帮助。" };
 }
 
 async function executeUnifiedMemoryCommand(command, normalized, event) {
@@ -2923,6 +2824,12 @@ async function executeUnifiedMemoryCommand(command, normalized, event) {
   return null;
 }
 
+async function clearMemoryWithContactEvidence(options = {}) {
+  const scope = options.scope ?? 'owner';
+  if (scope === 'all' || isPrivateScope(scope)) await lifeContacts?.forgetPauseEvidence(scope);
+  return unifiedMemory.clear(options);
+}
+
 async function executePendingUnifiedMemoryClear() {
   if (!state.unifiedMemoryPendingClear) {
     return { ok: false, summary: "No pending unified memory clear", reply: "现在没有待确认的统一记忆清除操作。" };
@@ -2932,7 +2839,7 @@ async function executePendingUnifiedMemoryClear() {
     return { ok: false, summary: "Unified memory clear expired", reply: "统一记忆清除确认已过期。" };
   }
   state.unifiedMemoryPendingClear = null;
-  await unifiedMemory.clear({ scope: "all" });
+  await clearMemoryWithContactEvidence({ scope: "all" });
   return { ok: true, summary: "Unified memory cleared", reply: "统一记忆已清空。" };
 }
 
@@ -4535,11 +4442,10 @@ async function buildIMessageInstructions() {
     "你正在为可信 iMessage 私聊生成一条回复。",
     "只输出最终要发送的中文文本，不要解释，不要写标题，不要使用 Markdown。",
     `你是 ${assistantName}。自称用“我”。对方是${ownerLabel}，可以自然使用这个称呼。`,
-    "私聊可以更自然一点，但仍然保持简短，通常 1 到 4 句。",
+    "按当前内容自然决定篇幅；招呼和轻量互动可以只回一句，认真求助按需展开。",
     "如果提供了长期滚动上下文，请把它当作私聊记忆使用：能承接前文，但不要主动复读记忆内容。",
     "不要在结尾追加 AI 助手味很重的服务式结束语，例如“想的话我还能……”“如果需要我可以……”“要不要我再……”。",
     "不要执行电脑操作；只有以 / 开头的 iMessage 指令由 Hub 执行。普通私聊只回应文本。",
-    "可以有少量自然动作描写，但只使用通用日常动作；具体角色外观和关系感由部署者 profile 提供。",
     "",
     "以下是可选风格摘要：",
     assistantSkillBrief
@@ -4668,14 +4574,15 @@ async function importImageToPhotos(filePath) {
 }
 
 function formatQuotedContext(event) {
+  if (event.pwaReplyContexts?.length) return event.pwaReplyContexts.map(context => formatQuotedContext({ ...event, pwaReplyContexts: null, replyContext: context })).join("\n\n");
   if (!event.replyContext) return "";
   const context = event.replyContext;
   const speaker = context.isSelf
     ? `${assistantName} 之前发出的消息`
-    : getSenderLabel(context.senderId, context.senderName);
+    : context.senderName || '对方';
   const text = stripMentionText(context.text || "");
-  const imageSummary = formatQqImageSummary(context.images || []);
-  if (!text && !imageSummary) return "";
+  const imageSummary = formatImageSummary(context.images || []);
+  if (!text && !imageSummary && !context.quotedText) return "";
   const replyHint = context.isSelf
     ? (context.scopeVerified ? "这条消息引用了你在当前私聊发过的内容。"
       : "用户引用了你的消息；桥接未提供原接收对象，不能断言这是你对当前对象说过的话。")
@@ -4683,7 +4590,11 @@ function formatQuotedContext(event) {
   return [
     "被回复/引用的消息上下文：",
     replyHint,
-    `${speaker}：${text || "（图片消息）"}`,
+    context.source ? `来源：${context.source === "qq" ? "旧QQ留存原文" : "网页消息"}；原时间：${context.createdAt || "未知"}。这是历史引用，不是当前新收到的发言。` : null,
+    context.truncated ? "原文只保留了部分，缺失内容不可补造。" : null,
+    context.mediaMissing ? "原消息图片未留存，本轮不可查看。" : null,
+    `${speaker}：${text || (context.quotedText ? "（仅留存当时的引用）" : "（图片消息）")}`,
+    context.quotedText ? `当时引用的原文（原说话方未记录，不当作当前对象自述）${context.quotedTruncated ? "，仅部分留存" : ""}：${context.quotedText}` : null,
     imageSummary ? `引用消息图片：${imageSummary}` : null
   ].filter(Boolean).join("\n");
 }
@@ -4695,7 +4606,9 @@ function runCodexCli(args, input, options) {
 async function executeCodexCli(args, input, options) {
   const startedAt = Date.now();
   const previousQuota = state.maintenance.codex.quota;
-  args = args.filter(arg => isMac || !['--ignore-user-config', '--ignore-rules'].includes(arg));
+  if (['qq-chat', 'qq-life-reply', 'qq-context-expansion'].includes(options.budgetPurpose)) {
+    args = [...args]; args.splice(1, 0, '-c', 'project_doc_max_bytes=0');
+  }
   if (!args.includes('--json')) args.splice(1, 0, '--json');
   const modelIndex = args.indexOf('-m');
   if (modelIndex !== -1 && args[modelIndex + 1] === 'default') args.splice(modelIndex, 2);
@@ -4709,23 +4622,32 @@ async function executeCodexCli(args, input, options) {
     childEnv.NO_PROXY = childEnv.NO_PROXY || 'localhost,127.0.0.1,::1';
   }
   try {
+    if (options.signal?.aborted) throw Object.assign(new Error('Reply superseded by newer input'), { code: 'REPLY_SUPERSEDED' });
     if (localConfig.codexProxy) {
       try { await assertProxyReachable(localConfig.codexProxy); }
       catch (error) { error.safeForChat = true; throw error; }
     }
-    let exited = false;
-    const noteExit = () => { if (!exited) { exited = true; activeCliProcesses--; } };
+    if (options.signal?.aborted) throw Object.assign(new Error('Reply superseded by newer input'), { code: 'REPLY_SUPERSEDED' });
+    await options.beforeRun?.();
+    let exited = false, spawned = false, releaseTemporary = () => {};
+    const noteExit = () => { if (!exited) { exited = true; activeCliProcesses--; releaseTemporary(); } };
     activeCliProcesses++;
     let result;
     try {
       result = await runCliProcess({ ...invocation, cwd: options.cwd, env: childEnv,
-        input, timeout: options.timeout, earlyReply: Boolean(options.earlyReply), onExit: noteExit });
-    } catch (error) { noteExit(); throw error; }
+        input, timeout: options.timeout, earlyReply: Boolean(options.earlyReply), signal: options.signal, onExit: noteExit,
+        onSpawn: () => { spawned = true; releaseTemporary = options.temporary?.retain() || (() => {}); } });
+    } catch (error) { if (!spawned) noteExit(); throw error; }
     state.maintenance.codex.lastOk = true;
     state.maintenance.codex.lastError = null;
     void refreshCodexQuotaSnapshotAfterRun({ startedAtMs: startedAt, previousQuota }).catch(() => null);
     return result;
   } catch (caught) {
+    // A replacement is normal turn scheduling. Keep its usage for the meter,
+    // without publishing a CLI failure or retaining the discarded draft in logs.
+    if (['REPLY_SUPERSEDED','MEMORY_EPOCH_CHANGED','HISTORY_SOURCE_CHANGED'].includes(caught.code)) throw caught;
+    if (options.signal?.aborted) throw Object.assign(new Error('Reply superseded by newer input'), {
+      code: 'REPLY_SUPERSEDED', usage: caught.usage || null, cliTiming: caught.cliTiming });
     const reference = crypto.randomUUID();
     const logPath = join(projectDir, 'runtime', 'logs', `cli-error-${reference}.json`);
     try {
@@ -4749,62 +4671,316 @@ async function executeCodexCli(args, input, options) {
 async function ensureCodexReplyWorkspace() {
   await mkdir(codexWorkspaceDir, { recursive: true });
   await mkdir(codexTmpDir, { recursive: true });
-  if (await access(join(codexWorkspaceDir, 'AGENTS.md')).then(() => true).catch(() => false)) return;
-  await writeFile(
-    join(codexWorkspaceDir, "AGENTS.md"),
-    [
-      // Deployment customization: this generated AGENTS.md must stay generic.
-      // Add a custom assistant profile via CODEX_REMOTE_CONTACT_ASSISTANT_PROFILE_PATH.
-      `# ${assistantName} QQ Reply Workspace`,
-      "",
-      "你在这里专门为 QQ 私聊生成回复。",
-      "只输出最终要发给对方的文本，自称用‘我’。",
-      `需要自称名字时使用 ${assistantName}。`,
-      ...(state.qq.enhancer.enabled ? buildQqReplyWorkspaceStyleInstructions() : []),
-      "以当前提示提供的人格与私聊上下文为准；管理员说普通话时也自然聊天，只有明确的 / 指令属于管理操作。",
-      "可以参考 Hub 提供的联网查询摘要，不编造没有读到的内容，也不虚构已经执行的操作。",
-      "不复读昵称，不在结尾机械追加服务式邀约。",
-      "不透露私人配置、后台路径、凭据或其他对象的私聊。",
-      "涉及电脑或账号操作时遵循已授权范围；普通聊天不能替代操作授权。",
-      "如果需要通过 QQ 发图，单独输出一行 [[qq_image:/absolute/path/to/image.png]]。",
-      state.qq.enhancer.enabled ? "如果要发表情包，优先输出 [[qq_sticker:表情包名]]；表情包名必须来自提示里的本地表情包库。" : null,
-      "不要写解释、分析、标题或 Markdown。"
-    ].filter(Boolean).join("\n")
-  );
+  // Reply instructions are supplied explicitly per turn. Do not generate a
+  // second, stale AGENTS profile inside a runtime workspace.
 }
 
-async function sendOneBotPrivateReply(event, reply, { splitText = false } = {}) {
+function outboundLogicalId(scope, intentId) {
+  return 'pwa-out-' + createHash('sha256').update(scope + ':' + intentId).digest('hex');
+}
+
+async function dispatchPrivateSegments(event, segments, outbound = null, textComplete = false) {
+  if (!isPrivateMemoryEvent(event)) return { ok: false, reason: 'private-route-unavailable' };
+  if (!pwaWritable()) return { ok: false, reason: 'pwa-read-only' };
+  if (!pwaIdentityCurrent(event, pwaStore, { generation: true })) return { ok: false, reason: 'pwa-route-or-input-changed' };
+  const scope = memoryScope(event), identity = event.privateIdentity;
+  const kind = outbound?.kind || (event.pwaStatusReply || event.lifeStatusActivityId ? 'status' : event.backendCommand ? 'command' : 'exchange');
+  event.pwaLogicalReplyId ||= outbound?.intentId
+    ? outboundLogicalId(scope, outbound.intentId)
+    : privateLogicalReplyId(event, kind);
+  const logicalReplyId = event.pwaLogicalReplyId;
+  pwaActiveLogical.add(logicalReplyId);
+  const index = event.pwaSegmentIndex || 0;
+  const text = segments.filter(segment => segment.type === 'text').map(segment => String(segment.data?.text || '')).join('');
+  const converted = segments.filter(segment => segment.type === 'text' && String(segment.data?.text || '').length)
+    .map(segment => ({ type: 'text', text: String(segment.data.text) }));
+  if (segments.some(segment => segment.type === 'image')) converted.push(...await pwaMedia.publishOutboundMedia({
+    userId: identity.userId, segments: segments.filter(segment => segment.type === 'image') }));
+  if (event.creativeWorkId && text && (kind === 'exchange' && textComplete || kind === 'outbound')) {
+    converted.splice(0, converted.length, { type: 'work', workId: event.creativeWorkId, text });
+  }
+  if (!converted.length) return { ok: false, reason: 'empty-private-delivery' };
+  const evidenceFailure = await privateEvidenceFailure(event);
+  if (evidenceFailure) return { ok: false, reason: evidenceFailure };
+  if (!await pwaEventHistoryCurrent(event)) return { ok: false, reason: 'history-source-changed' };
+  const replyText = [event.pwaDeliveredText || '', text].filter(Boolean).join('\n\n');
+  const includePrivateThought = textComplete && kind === 'exchange' && event.learningModelReply === true
+    && !event.skipExchangeMemory && !event.pwaSkipMemory && Boolean(replyText.trim());
+  const includeImageCursor = kind === 'exchange' && textComplete && event.learningModelReply && !event.skipExchangeMemory && !event.pwaSkipMemory;
+  const projection = { version: 1, kind, logicalReplyId, event: projectionEvent(event, { includePrivateThought }), replyText,
+    skipMemory: event.pwaSkipMemory === true, mood: moodState.exportPending(event),
+    selection: event.learningSelectionMaterial || null,
+    ...(outbound ? { intentId: outbound.intentId, decisionId: outbound.decisionId,
+      epochToken: outbound.epochToken } : {}) };
+  try {
+    const result = pwaStore.publishSegments({ userId: identity.userId, scope,
+      routeVersion: identity.routeVersion, generation: identity.generation,
+      inboundIds: kind === 'outbound' ? [] : privateInboundIds(event),
+      imageCursor: includeImageCursor ? event.pwaImageCursor : null,
+      deliveryId: `${logicalReplyId}:${index}`, logicalReplyId, segmentIndex: index, segments: converted,
+      creativeContextKey: event.creativeBinding?.contextKey || '',
+      projection, projectionKey: logicalReplyId, allowedPendingProjectionKey: logicalReplyId });
+    event.pwaSegmentIndex = index + result.messages.length;
+    event.pwaDeliveredText = replyText;
+    event.sentMessageIds = [...new Set([...(event.sentMessageIds || []), ...result.messages.map(message => message.id)])];
+    pwaHttp?.changed(identity.userId);
+    return { ok: true, body: { data: { message_id: result.messages[0]?.id } },
+      deliveryId: result.deliveryId, durable: true };
+  } catch (error) {
+    if (['delivery-stale', 'intake-pending', 'projection-pending', 'account-unavailable', 'binding-pending'].includes(error.code)) {
+      return { ok: false, reason: error.code };
+    }
+    throw error;
+  }
+}
+
+function completedPwaSink(result, name) {
+  if (result?.ok === true) return result;
+  if (result?.reason === 'memory-epoch-changed') return { ...result, ok: true, skipped: true };
+  throw Object.assign(Error('PWA projection sink did not commit'), { code: `projection-${name}-incomplete` });
+}
+
+async function flushPwaProjections() {
+  if (!pwaStore || pwaProjectionRunning) return;
+  pwaProjectionRunning = true;
+  try {
+    for (const pending of pwaStore.listPendingProjections({ limit: 100 })) {
+      if (pwaActiveLogical.has(pending.payload?.logicalReplyId)) continue;
+      let job;
+      try {
+        job = pwaStore.claimProjection(pending.id);
+        const material = job.payload;
+        if (material?.version !== 1 || !material.event || !isPwaEvent(material.event)) throw Error('Unsupported PWA projection material');
+        const event = { ...material.event, sentMessageIds: material.sentMessageIds || [] };
+        const epochToken = material.epochToken || event.memoryEpochToken;
+        const current = epochToken && await unifiedMemory.isEpochCurrent(epochToken);
+        const results = {};
+        // Each sink owns its idempotency/CAS inside its own durable write. A
+        // newer input cannot discard an already-published conversation fact.
+        if (current && !material.skipMemory && !['status', 'command'].includes(material.kind)) {
+          if (material.selection) results.selection = completedPwaSink(await privateLearning?.commitSelectionProjection(material.selection), 'selection');
+          if (material.mood) results.mood = completedPwaSink(await moodState.commitProjection(material.mood, material.logicalReplyId), 'mood');
+          if (material.kind === 'outbound') {
+            results.memory = await unifiedMemory.writeOutbound({ scope: job.scope, replyText: material.replyText,
+              intentId: material.intentId, deliveryId: material.logicalReplyId, channel: 'pwa',
+              learningEligible: true, epochToken, sentMessageIds: event.sentMessageIds });
+            results.memory = completedPwaSink(results.memory, 'memory');
+            if (!results.memory.skipped && pwaWritable()) void Promise.resolve(privateLearning?.noteExchange({ scope: job.scope })).catch(() => {});
+          } else {
+            results.memory = completedPwaSink(await rememberPrivateExchange(event, material.replyText), 'memory');
+            if (event.privateThought && !results.memory.skipped && material.kind === 'exchange') {
+              results.privateThought = completedPwaSink(await unifiedMemory.withEpoch(epochToken, () =>
+                pwaStore.commitPrivateThought({ userId: event.privateIdentity.userId, scope: job.scope,
+                  epoch: epochToken.epoch, logicalReplyId: material.logicalReplyId,
+                  inboundIds: privateInboundIds(event), thought: event.privateThought })), 'private-thought');
+            }
+            results.browseIntent = await submitDeliveredBrowseIntent(event, { ok: true, textComplete: true }, { durable: true });
+          }
+        } else results.memory = { skipped: true, reason: current ? 'not-conversation-memory' : 'memory-epoch-changed' };
+        if (event.lifeIncomingTokens?.length && material.kind !== 'status') {
+          results.contact = completedPwaSink(await lifeContacts.reconcilePwaIncoming(event.lifeIncomingTokens, { sentMessageIds: event.sentMessageIds }), 'contact');
+        }
+        if (material.intentId && !material.decisionId) results.intent = completedPwaSink(await lifeContacts?.reconcilePwaIntent(material.intentId), 'intent');
+        if (event.lifeReplyEpisodeId) results.busy = completedPwaSink(await lifeReplies?.reconcilePwaDelivery?.({
+          episodeId: event.lifeReplyEpisodeId, kind: material.kind === 'status' ? 'status' : 'reply', sentMessageIds: event.sentMessageIds }), 'busy');
+        if (material.decisionId) results.conversation = completedPwaSink(await lifeConversation?.reconcilePwaDelivery?.(material.decisionId), 'conversation');
+        pwaStore.completeProjection(job.id, { ok: true, ...results });
+      } catch (error) {
+        if (job) pwaStore.failProjection(job.id, 'core-projection-failed');
+        console.error('PWA projection pending recovery:', pending.id, error.code || error.name);
+      }
+    }
+  } finally { pwaProjectionRunning = false; }
+}
+
+async function pumpPwaInbox() {
+  if (!pwaStore || pwaPumpRunning || serviceLifecycle?.stopping) return;
+  pwaPumpRunning = true;
+  let rescan = false;
+  try {
+    await flushPwaProjections();
+    if (!pwaWritable()) return;
+    const queued = [];
+    const settledVersion = pwaInboxSettledVersion;
+    // First project every accepted input, before dispatching any generation.
+    // SQLite acceptance itself already fences older output in publishSegments.
+    // Fix a high watermark so newly arriving work cannot extend this scan
+    // forever. Keyset pages also pass earlier blocked/active scopes safely.
+    const throughSeq = pwaStore.pendingInboxHighWatermark();
+    let afterSeq = 0;
+    while (afterSeq < throughSeq) {
+    const page = pwaStore.listPendingInbox({ limit: 1000, afterSeq, throughSeq });
+    if (!page.length) break;
+    afterSeq = page.at(-1).message.seq;
+    for (let inbox of page) {
+      if (pwaActiveInbox.has(inbox.id)) continue;
+      const payload = pwaPayloadForInbox(inbox);
+      const identity = inbox.identity;
+      const event = normalizePrivateEvent(payload, { channel: 'pwa', privateIdentity: identity });
+      if (!pwaIdentityCurrent(event, pwaStore)) {
+        pwaStore.completeInbox(inbox.id, { state: 'cancelled', reason: 'identity-or-route-changed' }); continue;
+      }
+      let context = inbox.context;
+      if (inbox.state === 'accepted') {
+        const capturedEpoch = await unifiedMemory.captureEpoch({ scope: memoryScope(event) });
+        const contactToken = await lifeContacts.observeIncoming(event, { epochToken: capturedEpoch });
+        // A contact receipt may already exist after a crash before the SQLite
+        // acknowledgement. Preserve its old epoch through a later memory reset.
+        const memoryEpochToken = lifeContacts.incomingEpoch(contactToken) || capturedEpoch;
+        context = { channel: 'pwa', privateIdentity: identity, memoryEpochToken,
+          contactToken, lifeIncomingTokens: [contactToken], contactEvidence: contactEvidenceFor(event, contactToken) };
+        inbox = pwaStore.markInboxProjected(inbox.id, context);
+        if (contactToken.stop) { pwaStore.completeInbox(inbox.id, { reason: 'contact-stop' }); continue; }
+      }
+      if (!context?.contactToken || !context.memoryEpochToken) throw Error('PWA intake missing durable contact context');
+      if (event.backendCommand) {
+        if (inbox.state === 'processing') {
+          // A process may have exited after an administrator action but before
+          // its result. Never replay arbitrary administrative side effects.
+          pwaStore.completeInbox(inbox.id, { state: 'failed', reason: 'command-outcome-unknown' }); continue;
+        }
+        await lifeContacts.cancelIncoming(context.lifeIncomingTokens, 'presence-only');
+        context = { ...context, lifeIncomingTokens: [] };
+      } else {
+        const delivery = lifeContacts.incomingState(context.contactToken);
+        if (delivery === 'sent') { pwaStore.completeInbox(inbox.id, { reason: 'durable-delivery-reconciled' }); continue; }
+        if (delivery === 'uncertain' || delivery === 'sending') {
+          // All durable mailbox projections have already reconciled published
+          // delivery. No published result exists for this remaining input.
+          if (pwaStore.hasPendingProjection(identity.memoryScope)) continue;
+          await lifeContacts.recoverPwaIncoming(context.lifeIncomingTokens);
+        }
+      }
+      if (!await unifiedMemory.isEpochCurrent(context.memoryEpochToken)) {
+        await lifeContacts.cancelIncoming(context.lifeIncomingTokens);
+        pwaStore.completeInbox(inbox.id, { state: 'cancelled', reason: 'memory-epoch-changed' }); continue;
+      }
+      queued.push({ inbox, payload, context, event });
+    }
+    }
+    // An old attempt can settle while a newer accepted input is awaiting its
+    // contact projection. Rebuild in durable message order before queuing: the
+    // earlier inbox may have been active (and skipped) at the start of this scan.
+    // The dispatch loop below has no awaits, so this check and admission form
+    // one event-loop turn; a still-active attempt is replaced by MessageBatches.
+    if (pwaInboxSettledVersion !== settledVersion) { rescan = true; return; }
+    for (const { inbox, payload, context, event } of queued) {
+      const scope = context.privateIdentity.memoryScope;
+      // A newer accepted input may be beyond this bounded scan or may have
+      // arrived during projection. Do not generate against an incomplete scope.
+      if (pwaStore.hasPendingProjection(scope) || pwaStore.hasAcceptedInbox(scope)) continue;
+      let reservation;
+      if (!event.backendCommand) {
+        lifeConversation?.observeIncoming(event, context.contactToken);
+        if (lifeAvailable() && lifeReplies) {
+          reservation = lifeReplies.reserveIncoming(event);
+          if (!reservation.ok) continue;
+        }
+      }
+      pwaStore.claimInbox(inbox.id);
+      pwaActiveInbox.add(inbox.id); activeEvents++;
+      messageBatches.push(payload, context).then(result => {
+        // The replacement still owns these inputs only in memory. Keep every
+        // original inbox recoverable until its final reply or durable deferral.
+        // Graceful stop can reach a claimed entry while it is still waiting in
+        // the batch queue. No conversation happened; retain it for restart.
+        if (!result?.merged && !result?.superseded && result?.reason !== 'service-stopping') pwaStore.completeInbox(inbox.id);
+      }).catch(error => {
+        pwaStore.completeInbox(inbox.id, { state: 'failed', reason: 'private-processing-failed' });
+        console.error('PWA input failed:', inbox.id, error.code || error.name);
+      }).finally(() => {
+        if (reservation?.id) lifeReplies?.releaseIncomingReservation(reservation.id);
+        pwaActiveInbox.delete(inbox.id); activeEvents--;
+        pwaInboxSettledVersion++;
+        schedulePwaWork();
+      });
+    }
+  } catch (error) { console.error('PWA inbox paused:', error.code || error.name); }
+  finally { pwaPumpRunning = false; if (rescan) schedulePwaWork(); }
+}
+function schedulePwaWork() {
+  if (!pwaStore || serviceLifecycle?.stopping) return;
+  queueMicrotask(() => { if (!serviceLifecycle?.stopping) void backgroundTask(pumpPwaInbox()); });
+}
+
+async function sendPrivateReply(event, reply, { splitText = false } = {}) {
   if (!isPrivateMemoryEvent(event)) return { ok: false, reason: 'Private chat requires a valid participant' };
-  const message = await buildOneBotPrivateReplyMessage(reply);
-  return inReplyOrder(`private:${event.senderId}`, async () => {
+  // Honour an explicit layout request for this turn, including plain prose that
+  // the sender would otherwise divide at explicit paragraph boundaries.
+  const wantsOneMessage = splitText && stripMentionText(event.text).split(/[，,。！？!?；;\n]/u).some(
+    clause => /^(?:(?:这次|这条回复|请|麻烦)\s*){0,3}(?:只发一条(?:消息)?|用一条消息(?:发完|回复)|(?:别|不要|不用)分(?:段|开发|成几条发))(?:就好|就行|即可)?$/u.test(clause.trim())
+  );
+  const message = await buildPrivateReplyMessage(reply);
+  let outcome;
+  try { outcome = await inReplyOrder(privateQueueKey(event), async () => {
     if (/^\s*\//.test(event.text || '')) {
       const commandDelayMs = 2000 + Math.floor(Math.random() * 4001);
       if (event.timings) event.timings.commandDelayMs = commandDelayMs;
       await sleep(commandDelayMs);
     }
-    return sendTextThenSticker(message, async segments => {
-      const result = await sendCurrentPrivateSegments(event, segments);
-      const id = result.ok ? result.body?.data?.message_id : null;
-      if (id != null) event.sentMessageIds = [...(event.sentMessageIds || []), String(id)].slice(-8);
-      return result;
-    }, { splitText });
-  });
+    const result = await sendTextThenSticker(message, (segments, { textComplete = true } = {}) => sendCurrentPrivateSegments(event, segments, textComplete),
+      { splitText: splitText && !wantsOneMessage && !event.creativeWorkId });
+    return sendRetrievalExpiryFallback(event, result);
+  }); return outcome;
+  } catch (error) { outcome = { ok: false, uncertain: event.lifeTransportStarted === true }; throw error; }
+  finally { await finishPrivateIncoming(event, outcome); }
+}
+
+async function privateEvidenceFailure(event) {
+  try { if (event.chatEvidenceValidity) await event.chatEvidenceValidity(); }
+  catch (error) { return error?.code === 'RETRIEVAL_EVIDENCE_EXPIRED' ? 'retrieval-evidence-expired' : 'retrieval-evidence-changed'; }
+  try { if (event.videoEvidenceValidity) await event.videoEvidenceValidity(); }
+  catch (error) { return error?.code === 'VIDEO_EVIDENCE_EXPIRED' ? 'video-evidence-expired' : 'video-evidence-changed'; }
+  return null;
+}
+
+async function sendRetrievalExpiryFallback(event, outcome) {
+  discardCancelledWork(event, outcome?.reason);
+  if (!['retrieval-evidence-expired', 'video-evidence-expired'].includes(outcome?.reason) || event.sentMessageIds?.length) return outcome;
+  // The user still receives one outcome for their accepted input. No new
+  // search/model call, stale draft, expression learning or image is released.
+  const text = outcome.reason === 'video-evidence-expired' ? '刚才取得的视频资料已经过时，这次先不据此作答。' : '刚才查到的资料已经过时，这次先不据此作答。';
+  event.chatEvidenceValidity = null;
+  event.videoEvidenceValidity = null;
+  event.retrievalFallbackText = text;
+  event.creativeWorkId = null;
+  event.skipExchangeMemory = true; event.pwaSkipMemory = true; event.learningModelReply = false;
+  event.learningSelectionMaterial = undefined; event.learningSelectionCommit = undefined; event.lifeBrowseIntent = null;
+  event.privateThought = null;
+  const result = await sendCurrentPrivateSegments(event, [{ type: 'text', data: { text } }]);
+  return { ...result, deliveredText: result.ok ? text : '', textComplete: result.ok === true };
 }
 
 function isCurrentLifeReply(event) {
-  if (!lifeContacts || /^\s*\//.test(event.text || '')) return true;
+  if (event.backendCommand === true) return true;
+  if (!lifeContacts || contactFailure) return false;
   return isLifeReplyEligible(event) && lifeContacts.isCurrent(event.lifeContactToken);
 }
 
 // Run inside the recipient's send queue, immediately before each transport
 // invocation. A text reply and its optional sticker are separate boundaries.
-function sendCurrentPrivateSegments(event, segments) {
+async function finishPrivateIncoming(event, result) {
+  if (!event.lifeDeliveryClaimed || event.lifeStatusActivityId || event.pwaStatusReply) return;
+  try {
+    await lifeContacts.finishIncoming(event.lifeIncomingTokens, { ok: result?.ok === true,
+      uncertain: result?.uncertain === true || event.lifeDeliveryUncertain === true,
+      sentMessageIds: event.sentMessageIds || [], reason: result?.reason });
+    event.lifeDeliveryClaimed = false;
+    if (result?.reason === 'memory-epoch-changed') await lifeContacts.cancelIncoming(event.lifeIncomingTokens);
+  } catch { persistenceFailed = true; console.error('Incoming delivery completion could not persist; sending claim remains uncertain'); }
+}
+function sendCurrentPrivateSegments(event, segments, textComplete = false) {
+  if (event.personaToken && !personaPolicy?.isCurrent(event.personaToken)) return Promise.resolve({ ok: false, reason: 'persona-revision-changed' });
+  if (event.replyTurn?.signal.aborted) return Promise.resolve({ ok: false, reason: 'reply-superseded' });
   if (!isCurrentLifeReply(event)) return Promise.resolve({ ok: false, reason: 'contact-epoch-superseded' });
-  const send = () => {
+  const send = async () => {
     // The coordinator may wait for an earlier state write. Recheck permissions
     // and a catch-up's availability after that wait as well as after send order.
     if (!isCurrentLifeReply(event)) return { ok: false, reason: 'contact-epoch-superseded' };
-    if (lifeTimeline && !/^\s*\//.test(event.text || '')) {
+    if (!privateInputCurrent(event)) return { ok: false, reason: 'new-input-accepted' };
+    const evidenceFailure = await privateEvidenceFailure(event);
+    if (evidenceFailure) return { ok: false, reason: evidenceFailure };
+    if (lifeAvailable() && event.backendCommand !== true) {
       const available = lifeTimeline.availability({ scope: memoryScope(event) });
       if (event.lifeStatusActivityId) {
         if (!available.busy || available.activityId !== event.lifeStatusActivityId) return { ok: false, reason: 'life-status-expired' };
@@ -4812,36 +4988,54 @@ function sendCurrentPrivateSegments(event, segments) {
         return { ok: false, reason: 'life-choice-replaced' };
       }
     }
+    if (!event.lifeStatusActivityId && !event.pwaStatusReply && event.backendCommand !== true && !event.lifeDeliveryClaimed) {
+      const claim = await lifeContacts.beginIncoming(event.lifeIncomingTokens);
+      if (!claim.ok) return claim;
+      event.lifeDeliveryClaimed = true;
+      if (event.lifeMarkSending && !await event.lifeMarkSending()) return { ok: false, reason: 'contact-stopped-or-stale' };
+    }
+    if (event.backendCommand !== true && (!personaCurrent() || event.personaToken && !personaPolicy?.isCurrent(event.personaToken))) return { ok: false, reason: 'persona-revision-changed' };
+    if (event.learningValidity && !await event.learningValidity()) return { ok: false, reason: 'learned-source-changed' };
+    // Claims may wait for fsync. No new stop or replacement may cross transport.
+    if (!isCurrentLifeReply(event)) return { ok: false, reason: 'contact-epoch-superseded' };
+    if (!privateInputCurrent(event)) return { ok: false, reason: 'new-input-accepted' };
+    if (lifeAvailable() && event.backendCommand !== true) {
+      const latest = lifeTimeline.availability({ scope: memoryScope(event) });
+      if (event.lifeStatusActivityId ? !latest.busy || latest.activityId !== event.lifeStatusActivityId
+        : latest.busy || lifeConversation && !lifeConversation.isReplyCurrent(event.lifeReplyTicket)) return { ok: false, reason: 'life-choice-replaced' };
+    }
+    // Lock the candidate at the actual transport boundary, after any awaited
+    // contact checks. A later input must never replay an uncertain/partial send.
+    if (!await readingNotesCurrent(event.noteRefs, { scope: memoryScope(event), epochToken: event.memoryEpochToken })) {
+      return { ok: false, reason: 'note-source-changed' };
+    }
+    if (event.learningValidity && !await event.learningValidity()) return { ok: false, reason: 'learned-source-changed' };
+    if (event.backendCommand !== true && (!personaCurrent() || event.personaToken && !personaPolicy?.isCurrent(event.personaToken))) return { ok: false, reason: 'persona-revision-changed' };
+    if (!isCurrentLifeReply(event)) return { ok: false, reason: 'contact-epoch-superseded' };
+    if (event.replyTurn && !event.replyTurn.beginDelivery()) return { ok: false, reason: 'reply-superseded' };
+    if (!privateInputCurrent(event)) return { ok: false, reason: 'new-input-accepted' };
     event.lifeTransportStarted = true;
-    return sendOneBotSegments('private', Number(event.senderId), segments);
+    try {
+      const result = await dispatchPrivateSegments(event, segments, null, textComplete);
+      const id = result.ok ? result.body?.data?.message_id : null;
+      if (id != null) event.sentMessageIds = [...new Set([...(event.sentMessageIds || []), String(id)])].slice(-8);
+      if (result.uncertain) event.lifeDeliveryUncertain = true;
+      return result;
+    } catch (error) { event.lifeDeliveryUncertain = true; throw error; }
   };
-  return lifeContacts && !/^\s*\//.test(event.text || '')
-    ? lifeContacts.sendIfCurrent(event.lifeContactToken, send)
-    : send();
+  const guarded = () => event.backendCommand === true ? send()
+    : unifiedMemory.withEpoch(event.memoryEpochToken, send);
+  return lifeContacts && event.backendCommand !== true
+    ? lifeContacts.sendIfCurrent(event.lifeContactToken, guarded)
+    : guarded();
 }
 
-async function sendOneBotSegments(type, id, message) {
-  if (type !== 'private') return { ok: false, reason: 'Private-only mode' };
-  if (!/^[1-9]\d*$/.test(String(id))) return { ok: false, reason: 'Invalid private recipient' };
-  const response = await oneBotFetch(`${oneBotApiBase}/send_private_msg`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ user_id: id, message })
-  });
-  const body = await response.json().catch(() => ({}));
-  const ok = response.ok && (body.status == null || body.status === 'ok');
-  if (ok && body.data?.message_id != null) {
-    const key = String(body.data.message_id);
-    privateDeliveryRecipients.delete(key);
-    privateDeliveryRecipients.set(key, String(id));
-    while (privateDeliveryRecipients.size > 5000) privateDeliveryRecipients.delete(privateDeliveryRecipients.keys().next().value);
-  }
-  return { ok, status: response.status, body };
-}
-async function buildOneBotPrivateReplyMessage(reply) {
+
+async function buildPrivateReplyMessage(reply) {
   reply = ensureStickerLeadText(reply);
   const message = [];
-  const imagePaths = await resolveQqReplyMedia(reply, { stickerDir: qqStickerDir });
-  const text = stripQqImageAttachmentMarkers(reply);
+  const imagePaths = await resolveReplyMedia(reply, { stickerDir: stickerDir });
+  const text = stripImageAttachmentMarkers(reply);
   if (text) {
     message.push({
       type: "text",
@@ -4849,7 +5043,7 @@ async function buildOneBotPrivateReplyMessage(reply) {
     });
   }
   for (const imagePath of imagePaths) {
-    message.push(buildQqImageSegment(imagePath));
+    message.push(buildImageSegment(imagePath));
   }
   if (message.length === 0) {
     message.push({
@@ -4860,108 +5054,11 @@ async function buildOneBotPrivateReplyMessage(reply) {
   return message;
 }
 
-async function fetchOneBotMessage(messageId, selfId, privateSenderId) {
-  if (!messageId) return null;
-  const response = await oneBotFetch(`${oneBotApiBase}/get_msg`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ message_id: Number(messageId) })
-  });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok || body.status !== "ok" || !body.data) {
-    throw new Error(`Unable to fetch quoted QQ message ${messageId}`);
-  }
 
-  const data = body.data;
-  const sourceSender = data.user_id ?? data.sender?.user_id;
-  const senderId = sourceSender == null ? undefined : String(sourceSender);
-  const isSelf = selfId != null && senderId === String(selfId);
-  const targetId = data.target_id == null ? null : String(data.target_id);
-  if (privateSenderId != null && (data.group_id != null
-    || (data.message_type != null && data.message_type !== 'private')
-    || ![String(privateSenderId), String(selfId)].includes(senderId)
-    || (targetId != null && targetId !== String(isSelf ? privateSenderId : selfId)))) {
-    throw Error('Quoted message is outside this private conversation');
-  }
-  if (isSelf && privateSenderId != null && targetId == null) {
-    const deliveredTo = privateDeliveryRecipients.get(String(data.message_id ?? messageId));
-    const confirmed = deliveredTo != null ? deliveredTo === String(privateSenderId)
-      : await unifiedMemory.hasDeliveredMessage({ scope: `qq:private:${privateSenderId}`, messageId: String(data.message_id ?? messageId) });
-    if (!confirmed) throw Error('Quoted bot message recipient cannot be verified');
-  }
-  const segments = Array.isArray(data.message) ? data.message : [];
-  const forwardSegment = segments.find((segment) => segment?.type === "forward");
-  const textFromSegments = segments
-    .filter((segment) => segment?.type === "text")
-    .map((segment) => segment.data?.text ?? "")
-    .join("")
-    .trim();
-  const forwardContext = forwardSegment?.data?.id
-    ? await fetchOneBotForwardContent(forwardSegment.data.id).catch(() => null)
-    : null;
-  const images = dedupeQqImages([
-    ...extractOneBotImageInputs(data),
-    ...((forwardContext?.images) || [])
-  ]);
-  return {
-    messageId: String(data.message_id ?? messageId),
-    senderId,
-    senderName: data.sender?.card || data.sender?.nickname || senderId || "对方",
-    text: forwardContext?.text
-      ? `[合并转发]\n${forwardContext.text}`
-      : (data.raw_message || textFromSegments),
-    images,
-    isSelf,
-    scopeVerified: privateSenderId != null,
-    raw: data
-  };
-}
 
-async function fetchOneBotForwardContent(forwardId) {
-  const response = await oneBotFetch(`${oneBotApiBase}/get_forward_msg`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ id: String(forwardId) })
-  });
-  const body = await response.json().catch(() => ({}));
-  const messages = Array.isArray(body.data?.messages)
-    ? body.data.messages
-    : Array.isArray(body.data)
-      ? body.data
-      : [];
-  if (!response.ok || body.status !== "ok" || messages.length === 0) {
-    throw new Error(`Unable to fetch forward QQ message ${forwardId}`);
-  }
 
-  const lines = [];
-  const images = [];
-  for (const node of messages) {
-    const senderName = node?.sender?.card || node?.sender?.nickname || node?.nickname || "对方";
-    const segments = Array.isArray(node?.content)
-      ? node.content
-      : Array.isArray(node?.message)
-        ? node.message
-        : Array.isArray(node?.data?.content)
-          ? node.data.content
-          : [];
-    const text = segments
-      .filter((segment) => segment?.type === "text")
-      .map((segment) => segment.data?.text ?? "")
-      .join("")
-      .trim();
-    const nodeImages = extractOneBotImageInputs({ message: segments });
-    if (text) lines.push(`${senderName}：${text}`);
-    else if (nodeImages.length > 0) lines.push(`${senderName}：[图片]`);
-    images.push(...nodeImages);
-  }
 
-  return {
-    text: lines.join("\n").trim(),
-    images: dedupeQqImages(images)
-  };
-}
-
-function dedupeQqImages(images) {
+function dedupePrivateImages(images) {
   const seen = new Set();
   const output = [];
   for (const image of images || []) {
@@ -4973,77 +5070,72 @@ function dedupeQqImages(images) {
   return output;
 }
 
+async function pwaEventHistoryCurrent(event) {
+  if (!event.pwaHistoryRefs?.length) return true;
+  return Boolean(isPwaEvent(event) && pwaIdentityCurrent(event, pwaStore)
+    && await pwaHistorySourcesCurrent(pwaHistory, event.privateIdentity.userId, event.pwaHistoryRefs)
+    && pwaIdentityCurrent(event, pwaStore));
+}
+
 async function attachReplyContext(event) {
-  if (!event.replyMessageId) return event;
-  try {
-    const replyContext = await fetchOneBotMessage(event.replyMessageId, event.selfId, event.senderId);
-    return {
-      ...event,
-      replyContext,
-      isReplyToSelf: Boolean(replyContext?.isSelf)
-    };
-  } catch (error) {
-    return {
-      ...event,
-      replyContextError: error.message,
-      isReplyToSelf: false
-    };
+  if (!event.replyMessageId && !event.pwaReplyRefs?.length) return event;
+  if (isPwaEvent(event)) {
+    const refs = [...new Set(event.pwaReplyRefs || [pwaMessageId(event.replyMessageId)])];
+    const contexts = [], fingerprints = []; let missing = false;
+    for (const ref of refs) {
+      try {
+        const quoted = await pwaHistory.resolve(event.privateIdentity.userId, ref);
+        if (!pwaIdentityCurrent(event, pwaStore)) throw Error('History identity changed');
+        const isSelf = quoted.speaker === 'assistant';
+        fingerprints.push({ id: quoted.id, fingerprint: pwaHistoryFingerprint(quoted) });
+        contexts.push({ messageId: quoted.id, senderId: isSelf ? 'assistant' : event.senderId,
+          senderName: isSelf ? assistantName : event.senderName,
+          text: quoted.text || '', images: (quoted.mediaIds || []).map(id => ({ file: id })),
+          source: quoted.source, createdAt: quoted.createdAt, truncated: quoted.truncated, mediaMissing: quoted.mediaMissing,
+          quotedText: quoted.quotedText, quotedTruncated: quoted.quotedTruncated,
+          isSelf, scopeVerified: true });
+      } catch { missing = true; }
+    }
+    const combined = contexts.length ? { ...contexts[0], text: contexts.map(context => context.text).join('\n'),
+      images: contexts.flatMap(context => context.images) } : undefined;
+    return { ...event, isReplyToSelf: Boolean(combined?.isSelf), replyContext: combined,
+      pwaReplyContexts: contexts, pwaHistoryRefs: fingerprints,
+      replyContextError: missing ? '部分引用消息已不可用' : undefined };
   }
+  return { ...event, replyContextError: '引用来源不可用', isReplyToSelf: false };
 }
 
-function normalizeOneBotEvent(payload) {
-  const segments = Array.isArray(payload.message) ? payload.message : [];
-  const hasAudioSegment = segments.some((segment) => ["record", "voice", "audio"].includes(String(segment?.type || "").toLowerCase()));
-  const textFromSegments = segments
-    .filter((segment) => segment?.type === "text")
-    .map((segment) => segment.data?.text ?? "")
-    .join("")
-    .trim();
-  const hasAtSegment = segments.some((segment) => segment?.type === "at");
-  const hasSelfAtSegment = segments.some((segment) => isSelfAtSegment(segment, payload.self_id));
-  const atTargets = segments
-    .filter((segment) => segment?.type === "at")
-    .map((segment) => segment.data?.qq ?? segment.data?.id ?? segment.data?.uin)
-    .filter((target) => target != null)
-    .map(String);
-  const replySegment = segments.find((segment) => segment?.type === "reply");
-  const replyMessageId = replySegment?.data?.id || replySegment?.data?.message_id;
-  const images = extractOneBotImageInputs(payload);
 
-  return {
-    type: "private_message",
-    selfId: payload.self_id == null ? undefined : String(payload.self_id),
-    senderId: payload.user_id == null ? undefined : String(payload.user_id),
-    senderName: payload.sender?.card || payload.sender?.nickname || String(payload.user_id || "对方"),
-    text: payload.raw_message || textFromSegments,
-    images,
-    hasAudioSegment,
-    hasAtSegment,
-    hasSelfAtSegment,
-    atTargets,
-    hasReplySegment: Boolean(replySegment),
-    replyMessageId: replyMessageId == null ? undefined : String(replyMessageId),
-    isReplyToSelf: false,
-    raw: payload
-  };
+
+
+
+function privateInputCurrent(event) {
+  return isPrivateMemoryEvent(event) && pwaIdentityCurrent(event, pwaStore, { generation: true });
+}
+function capturePrivateRoute(event) { return event; }
+async function awaitPrivateProjection(scope) {
+  while (pwaStore?.hasPendingProjection(scope)) {
+    if (serviceLifecycle?.stopping) return false;
+    await flushPwaProjections();
+    if (pwaStore.hasPendingProjection(scope)) await sleep(250);
+  }
+  return !serviceLifecycle?.stopping;
+}
+function refreshPrivateEvent(event) {
+  if (!isPwaEvent(event)) return { ...event, isOwner: false, backendCommand: false };
+  const identity = event.privateIdentity;
+  const current = pwaStore?.getIdentity(identity?.userId);
+  const isOwner = Boolean(current?.enabled && current.bindingStatus === 'active' && current.role === 'admin'
+    && current.memoryScope === identity?.memoryScope && identity?.role === 'admin');
+  return { ...event, isOwner, backendCommand: isBackendPrivateCommand({ ...event, isOwner }),
+    senderLabel: isOwner ? ownerLabel : event.senderName || '对方' };
+}
+function normalizePrivateEvent(payload, context = {}) {
+  if (context.channel !== 'pwa') throw Error('Unsupported private transport');
+  return refreshPrivateEvent(trustedPwaEvent(normalizePrivatePayload(payload), context.privateIdentity));
 }
 
-function isSelfAtSegment(segment, selfId) {
-  if (segment?.type !== "at" || selfId == null) return false;
-  const target = segment.data?.qq ?? segment.data?.id ?? segment.data?.uin;
-  return target != null && String(target) === String(selfId);
-}
 
-function enrichQqEvent(event) {
-  const senderId = event.senderId == null ? undefined : String(event.senderId);
-  const isOwner = senderId ? state.qq.ownerUserIds.includes(senderId) : false;
-  return {
-    ...event,
-    senderId,
-    isOwner,
-    senderLabel: getSenderLabel(senderId, event.senderName)
-  };
-}
 
 function getEventDedupeKey(event) {
   const raw = event.raw || {};
@@ -5054,24 +5146,25 @@ function getEventDedupeKey(event) {
 function rememberEvent(key) {
   if (!key) return false;
   const now = Date.now();
-  for (const [seenKey, seenAt] of seenOneBotMessageIds) {
-    if (now - seenAt > seenMessageTtlMs) seenOneBotMessageIds.delete(seenKey);
+  for (const [seenKey, seenAt] of seenPrivateMessageIds) {
+    if (now - seenAt > seenMessageTtlMs) seenPrivateMessageIds.delete(seenKey);
   }
-  if (seenOneBotMessageIds.has(key)) return true;
-  seenOneBotMessageIds.set(key, now);
+  if (seenPrivateMessageIds.has(key)) return true;
+  seenPrivateMessageIds.set(key, now);
   return false;
 }
 
 async function handleApi(req, res) {
   if (req.method === 'GET' && req.url === '/api/platform') {
     return sendJson(res, 200, { platform: process.platform, imessage: isMac,
-      worldEnabled: Boolean(world), lifeEnabled: Boolean(lifeTimeline), lifePlanningEnabled: Boolean(lifePlanner), qqPrivateOnly: localConfig.qqPrivateOnly === true,
+      worldEnabled: Boolean(world), lifeEnabled: Boolean(lifeTimeline), lifePlanningEnabled: Boolean(lifePlanner), privateOnly: true,
+      lifeOperational: lifeAvailable(), worldOperational: Boolean(world), contactOperational: Boolean(lifeContacts && !contactFailure
+        && !lifeContacts.diagnostics().failed && !lifeContacts.diagnostics().closed),
+      autonomousBrowsingOperational: browseIntentsAvailable(),
       runtimeBudget: runtimeBudget.getStatus(),
       skills: Object.keys(installedSkills), chatSkill: resolveChatSkill(installedSkills, localConfig.chatSkill),
       remoteEnabled: privateTasks.enabled, remoteBusy: privateTasks.busy,
-      workspace: localConfig.workspace, owners: state.qq.ownerUserIds,
-      callback: 'http://127.0.0.1:' + (process.env.PORT || 3789) + '/api/onebot/event',
-      callbackSecretConfigured: Boolean(oneBotSecret) });
+      workspace: localConfig.workspace, privateTransport: 'pwa' });
   }
   if (req.method === "OPTIONS") {
     res.writeHead(204, corsHeaders());
@@ -5093,7 +5186,7 @@ async function handleApi(req, res) {
 
   if (req.method === "POST" && req.url === "/api/channel") {
     const body = await readBody(req);
-    if (!["qq", "imessage"].includes(body.channel)) {
+    if (!["imessage"].includes(body.channel)) {
       return sendJson(res, 400, { error: "Unknown channel" });
     }
     if (body.channel === 'imessage' && !isMac && body.enabled) return sendJson(res, 400, { error: 'iMessage 仅支持 macOS。' });
@@ -5145,80 +5238,6 @@ async function handleApi(req, res) {
     return sendJson(res, 400, { error: "Unknown memory scope" });
   }
 
-  if (req.method === "POST" && req.url === "/api/qq/event") {
-    const event = enrichQqEvent(await readBody(req));
-    delete event.lifeContactToken; delete event.lifeContactEvidence;
-    if (!isPrivateMemoryEvent(event)) return sendJson(res, 200, { ignored: true, reason: 'Private-only mode' });
-    const decision = shouldRespondToQq(event);
-    let reply = null;
-    let error = null;
-    let commandAction = null;
-    if (decision.ok) {
-      try {
-        commandAction = buildQqCommandAction(event);
-        reply = decision.reply || commandAction?.reply || buildBoundaryReply(event) || await buildModelReply(event);
-      } catch (caught) {
-        error = publicFailure(caught);
-        reply = caught.code === 'RUNTIME_BUDGET_BLOCKED' ? error : `${pickActionBeat(event)}这边刚刚卡了一下，等我再试一次。`;
-      }
-    }
-    const record = {
-      id: crypto.randomUUID(),
-      receivedAt: new Date().toISOString(),
-      source: "qq",
-      event,
-      decision,
-      reply,
-      error
-    };
-    // This endpoint previews a reply; no QQ delivery occurred to remember.
-    if (record.reply && commandAction?.afterSend) await commandAction.afterSend();
-    state.qq.events.unshift(record);
-    state.qq.events = state.qq.events.slice(0, 30);
-    return sendJson(res, 200, { status: "ok" });
-  }
-
-  if (req.method === 'POST' && req.url === '/api/onebot/event') {
-    const payload = await readBody(req);
-    if (serviceLifecycle?.stopping) return sendJson(res, 503, { error: 'Hub stopping; retry later' });
-    if (payload.post_type !== 'message' || payload.message_type !== 'private' || payload.group_id != null) return sendJson(res, 200, { ignored: true, reason: 'Private-only mode' });
-    delete payload.lifeContactToken;
-    delete payload.hubContactToken;
-    delete payload.hubContactContext;
-    const incoming = enrichQqEvent(normalizeOneBotEvent(payload));
-    let contactToken;
-    const observeContact = lifeContacts && isLifeReplyEligible(incoming);
-    if (lifeContacts && isLifeContactEligible(incoming) && isExplicitContactStop(incoming)) {
-      // Signature and private admission were checked first. Observe before the
-      // batching delay and workload limit so a stop fences in-flight sends.
-      contactToken = await lifeContacts.observeIncoming(incoming);
-      if (contactToken.stop) {
-        const timing = createReplyTiming();
-        const record = { id: crypto.randomUUID(), receivedAt: new Date(timing.receivedAt).toISOString(),
-          source: 'onebot', event: incoming, decision: { ok: true, status: '已停止联系', reason: 'contact-stop' },
-          timings: timing, completedAt: new Date().toISOString(), reply: null, send: null, error: null };
-        state.qq.events.unshift(record); state.qq.events = state.qq.events.slice(0, 30);
-        await saveReplyTiming(record);
-        return sendJson(res, 200, { status: 'ok', contact: 'stopped' });
-      }
-    }
-    if (activeEvents >= 16) return sendJson(res, 503, { error: 'Hub busy; retry later' });
-    activeEvents++;
-    try {
-      // A rejected ordinary callback is not consumed. Reserve workload before
-      // awaiting storage so concurrent callbacks cannot all pass the limit.
-      if (observeContact) {
-        contactToken = await lifeContacts.observeIncoming(incoming);
-        lifeConversation?.observeIncoming(incoming, contactToken);
-      }
-    } catch (error) { activeEvents--; throw error; }
-    // Acknowledge immediately: Codex can take minutes, longer than bridge HTTP timeouts.
-    sendJson(res, 200, {});
-    messageBatches.push(payload, { contactToken, contactEvidence: contactEvidenceFor(incoming, contactToken) }).catch(error => console.error('OneBot event failed:', error.message))
-      .finally(() => { activeEvents--; });
-    return true;
-  }
-
   return false;
 }
 
@@ -5242,67 +5261,133 @@ async function serveStatic(req, res) {
 }
 
 await loadSettings();
-state.qq.privateOnly = localConfig.qqPrivateOnly === true;
+state.privateChat.privateOnly = true;
 if (localConfig.assistantName) assistantName = localConfig.assistantName;
 assistantMentionAliases = normalizeList([...assistantMentionAliases, '@' + assistantName]);
 if (localConfig.chatModel) state.ai.model = localConfig.chatModel;
 if (isValidReasoningEffort(localConfig.chatReasoningEffort)) state.ai.reasoningEffort = localConfig.chatReasoningEffort;
-if (Array.isArray(localConfig.ownerUserIds)) state.qq.ownerUserIds = normalizeList(localConfig.ownerUserIds);
 await mkdir(localConfig.workspace, { recursive: true });
-await mkdir(qqStickerDir, { recursive: true });
+await mkdir(stickerDir, { recursive: true });
 await loadIMessageMemory();
 await loadRemoteExecutionMemory();
 updateIMessagePoller();
 
-const world = localConfig.world?.enabled ? await createWorld({ projectDir, config: localConfig, runtimeBudget,
+// Contact receipt/consent state remains available even when optional life/world
+// projections cannot recover. A corrupt contact ledger itself never permits send.
+try { lifeContacts = await createLifeContacts({ directory: join(dataDir, 'life') }); }
+catch (error) { contactFailure = error; console.error('Private contact state unavailable; ordinary ingress is held for recovery'); }
+unifiedMemory.subscribeLearningInvalidation(async event => {
+  if (['reset', 'correction', 'source-loss'].includes(event.reason)
+    && (event.scope === 'all' || isPrivateScope(event.scope))) await lifeContacts?.forgetPauseEvidence(event.scope);
+});
+try { world = localConfig.world?.enabled ? await createWorld({ projectDir, config: localConfig, runtimeBudget, personaPolicy,
+  runtimeCapabilities: options => currentRuntimeCapabilities(options),
+  isMemoryEpochCurrent: token => unifiedMemory.isEpochCurrent(token),
+  captureMemoryEpoch: options => unifiedMemory.captureEpoch(options),
   ...(localConfig.life?.enabled === true ? { recordExperience: input => {
     if (!lifeTimeline) throw Error('Life timeline is not ready for reading experiences');
     return lifeTimeline.recordExperience(input).then(result => { pumpLifeConversation(); return result; });
   } } : {}) }) : null;
+} catch (error) { console.error('Optional world unavailable; private chat remains available:', error.message); }
 const handleWorld = world ? createWorldHttp(world, { projectDir }) : null;
 if (localConfig.life?.enabled === true) {
   const directory = join(dataDir, 'life');
-  lifeTimeline = await createLifeTimeline({ directory });
   try {
-    personalLifeState = createLifeState({ timeline: lifeTimeline });
+    if (!lifeContacts) throw Error('Contact state is unavailable');
+    lifeTimeline = await createLifeTimeline({ directory, personaPolicy });
+    personalLifeState = createLifeState({ timeline: lifeTimeline, personaPolicy });
     // Validate the recovered projection before accepting a chat or planning call.
     personalLifeState.snapshot();
     // Replay only durable reading outcomes. This does not reopen pages or call
     // a model, and must finish before any planning or private chat sees state.
     await world?.flushLifeExperiences();
     personalLifeState.snapshot();
-    lifeContacts = await createLifeContacts({ directory, timeline: lifeTimeline });
     lifeConversation = await createLifeConversation({ directory, timeline: lifeTimeline, contacts: lifeContacts,
       readContext: readLifeConversationContext, decide: decideLifeConversation, dispatch: dispatchLifeConversation,
       isEligible: scope => isLifeContactEligible(contactEventFor(scope)) });
     lifeReplies = await createLifeReplies({ directory, timeline: lifeTimeline, contacts: lifeContacts,
       isEligible: isLifeReplyEligible,
+      isPaused: event => isPwaEvent(event) && !pwaWritable(),
       sendStatus: async (event, text) => {
         if (!isLifeReplyEligible(event)) return { ok: false };
         const statusEvent = { ...event, lifeStatusActivityId: lifeTimeline.availability({ scope: memoryScope(event) }).activityId };
-        return inReplyOrder(`private:${event.senderId}`, () => sendCurrentPrivateSegments(statusEvent, [{ type: 'text', data: { text } }]));
+        const result = await inReplyOrder(privateQueueKey(event), () => sendCurrentPrivateSegments(statusEvent, [{ type: 'text', data: { text } }]));
+        pwaActiveLogical.delete(statusEvent.pwaLogicalReplyId);
+        if (isPwaEvent(statusEvent)) await flushPwaProjections();
+        return result;
       },
       reply: resumeLifeReply });
     if (localConfig.life.planning?.enabled === true) {
       if (!world) throw Error('生活规划需要启用world以复用受限模型和预算');
       lifePlanner = await createLifePlanner({ directory, timeline: lifeTimeline, personalState: personalLifeState,
         enforceDailyLimit: localConfig.runtimeBudget?.mode !== 'observe',
+        readNotes: context => recallReadingNotes({ query: [
+          ...context.thoughts.map(item => item.text), ...context.experiences.map(item => item.summary || ''),
+          ...(context.longTermInterests || []).map(item => item.label || item.topic || '')].join('\n'),
+          explore: true, limit: 3, maxChars: 3600,
+          excludeText: context.experiences.map(item => item.summary || '').join('\n') }),
+        validateNoteRefs: readingNotesCurrent,
         decide: context => world.planLife(context) });
       lifeBrowsing = createLifeBrowsing({ timeline: lifeTimeline, world });
       lifeProactive = createLifeProactive({ timeline: lifeTimeline, contacts: lifeContacts,
         readCandidate: readLifeContactCandidate, decide: decideLifeContact,
+        validateNoteRefs: readingNotesCurrent,
         isEligible: scope => isLifeContactEligible(contactEventFor(scope)), dispatch: dispatchLifeContact });
+      if (browseIntentsEnabled) {
+        try { lifeBrowseIntents = await createLifeBrowseIntents({ directory, timeline: lifeTimeline, world,
+          decide: decideLifeBrowseIntent, isCurrent: intent => unifiedMemory.isEpochCurrent(intent.epochToken) }); }
+        catch { lifeBrowseFailure = true; console.error('Autonomous browsing unavailable; other life functions remain available'); }
+      }
     }
-  } catch (error) { await lifeConversation?.close(); await lifeReplies?.close(); await lifeContacts?.close(); await lifeTimeline.close(); await world?.close(); throw error; }
+  } catch (error) {
+    suspendLife(error);
+    await Promise.allSettled([lifeConversation?.close(), lifeReplies?.close(), lifePlanner?.close(), lifeBrowsing?.close(), lifeProactive?.close(), lifeBrowseIntents?.close()]);
+    await lifeTimeline?.close().catch(() => {});
+    lifeConversation = null; lifeReplies = null; lifePlanner = null; lifeBrowsing = null; lifeProactive = null; lifeBrowseIntents = null;
+    lifeTimeline = null; personalLifeState = null;
+  }
   reportLifeWarnings();
+}
+if (lifeAvailable() && pwaWritable() && pwaConfig.privateThoughtsEnabled === true && pwaConfig.privateThoughtActionsEnabled === true) {
+  privateThoughtActions = createPrivateThoughtActions({ store: pwaStore, decide: decidePrivateThought,
+    isCurrent: privateThoughtCurrent, canRead: () => state.privateChat.webLookup.enabled === true });
+}
+if (lifeAvailable() && pwaWritable() && pwaStore && pwaConfig.spaceEnabled === true) {
+  const canPublish = () => lifeAvailable() && pwaWritable() && !serviceLifecycle?.stopping && personaCurrent();
+  const publisher = createSpacePublisher({ store: pwaStore, decide: input => decideInSpace('space-post', input), canPublish, readArticle: createListedSpaceReader(),
+    readVideo: (url, options) => videoReader?.readForSpace(url, options) });
+  spaceTimeline = createSpaceTimeline({ timeline: lifeTimeline, store: pwaStore, publisher, canPublish });
+  spaceCommentReplies = createSpaceCommentReplies({ store: pwaStore, decide: input => decideInSpace('space-comment-reply', input), canReply: canPublish });
 }
 // Once planning owns the timeline, the old autonomous browser timer must not compete with it.
 if (!lifePlanner) world?.startScheduler();
 const handleLifeObserver = createLifeObserverHttp({ readSnapshot: () => ({
-  enabled: Boolean(lifeTimeline),
+  enabled: lifeAvailable(),
   snapshot: lifeTimeline?.snapshot(),
-  diagnostics: lifeTimeline?.diagnostics
-}) });
+  diagnostics: lifeTimeline?.diagnostics,
+  operations: lifeOperationalDiagnostics()
+}), readContactPauses: () => {
+  const diagnostics = lifeContacts?.diagnostics();
+  if (!lifeContacts || contactFailure || diagnostics?.failed || diagnostics?.closed) throw Error('Contact state unavailable');
+  return lifeContacts.pausedDetails();
+} });
+
+function lifeOperationalDiagnostics() {
+  const contacts = { enabled: Boolean(lifeContacts), ...lifeContacts?.diagnostics(),
+    failed: Boolean(contactFailure || lifeContacts?.diagnostics().failed) };
+  try {
+    const snapshot = lifeContacts?.snapshot();
+    if (snapshot) { contacts.total = snapshot.contacts.length; contacts.paused = lifeContacts.pausedDetails().length; }
+  } catch { contacts.failed = true; }
+  return {
+    planner: { enabled: Boolean(lifePlanner), ...lifePlanner?.diagnostics(),
+      ...(lifeFailure ? { failed: true, lastResult: 'storage-unavailable' } : {}) },
+    browsing: lifeBrowseIntents?.diagnostics() || { enabled: browseIntentsEnabled, failed: lifeBrowseFailure,
+      ...(lifeBrowseFailure ? { lastResult: 'storage-unavailable' } : {}) },
+    proactive: { enabled: Boolean(lifeProactive), ...lifeProactive?.diagnostics() },
+    learning: privateLearning?.diagnostics() || { enabled: false }, contacts
+  };
+}
 
 const server = createServer(async (req, res) => {
   if (serviceLifecycle?.stopping) {
@@ -5319,13 +5404,6 @@ const server = createServer(async (req, res) => {
     const origin = req.headers.origin;
     if (origin && origin !== 'http://' + req.headers.host) return sendJson(res, 403, { error: 'Cross-origin access denied' });
     if (handleWorld && await handleWorld(req, res)) return;
-    if (req.method === 'POST' && req.url === '/api/onebot/event') {
-      let size = 0; const chunks = [];
-      for await (const chunk of req) { size += chunk.length; if (size > 1024 * 1024) return sendJson(res, 413, { error: 'Body too large' }); chunks.push(chunk); }
-      const raw = Buffer.concat(chunks);
-      if (!validSignature(raw, req.headers['x-signature'], oneBotSecret)) return sendJson(res, 401, { error: 'Invalid OneBot signature' });
-      req.body = JSON.parse(raw.toString('utf8'));
-    }
     if (serviceLifecycle?.stopping) return sendJson(res, 503, { error: 'Hub stopping; retry later' });
     if (req.url?.startsWith("/api/")) {
       const handled = await handleApi(req, res);
@@ -5333,48 +5411,33 @@ const server = createServer(async (req, res) => {
     }
     await serveStatic(req, res);
   } catch (error) {
-    sendJson(res, 500, { error: error.message });
+    sendJson(res, Number.isInteger(error.statusCode) && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500,
+      { error: error.message });
   } finally { activeHttpRequests--; }
 });
 
-// A first deployment has to be able to tell what is actually wired up. This
-// prints capability state only; it never reads message content or credentials.
-async function reportStartupReadiness() {
-  const owners = Array.isArray(localConfig.ownerUserIds) ? localConfig.ownerUserIds : [];
-  const life = localConfig.life?.enabled === true;
-  const rows = [
-    [owners.length > 0, '管理员 QQ', owners.join(', ') || '未配置：任何私聊都不会得到回应'],
-    [Boolean(oneBotSecret), 'OneBot 回调密钥', oneBotSecret ? '已配置' : '未配置：所有回调都会以 401 拒绝'],
-    [state.channels.qq === true, 'QQ 通道', state.channels.qq ? '已开启' : '已关闭：只有后台指令可用'],
-    [life, '生活时间线', life ? '已启用' : '未启用：不规划、不主动联系'],
-    [life && localConfig.life?.planning?.enabled === true, '生活规划', life && localConfig.life?.planning?.enabled === true ? '已启用' : '未启用：需 life.enabled 与 life.planning.enabled 同时为真'],
-    [localConfig.world?.enabled === true, '网页浏览', localConfig.world?.enabled !== true ? '未启用：生活规划也无法运行'
-      : (localConfig.world.executablePath ? (localConfig.world.autoEnabled ? '可阅读（含自主探索）' : '可阅读（仅由生活时间线触发）')
-        : '未配置 world.executablePath：阅读会在需要时失败，规划不受影响')],
-    [true, '额度模式', localConfig.runtimeBudget?.mode === 'observe' ? 'observe：只记录、不拦截' : 'strict：未校准时会拒绝模型调用']
-  ];
-  const missing = rows.filter(([ok]) => !ok).length;
-  console.log(`知微配置：${localConfigPath(projectDir)}${missing ? `（${missing} 项未就绪）` : '（全部就绪）'}`);
-  for (const [ok, label, detail] of rows) console.log(`  ${ok ? 'OK  ' : 'TODO'} ${label}：${detail}`);
-  if (!owners.length || !oneBotSecret) console.log('  提示：先运行 npm run setup 完成初始化，再启动服务。');
-}
-
 server.listen(Number(process.env.PORT || 3789), '127.0.0.1', () => {
-  console.log(`知微 chat hub: http://127.0.0.1:${process.env.PORT || 3789}`);
-  void reportStartupReadiness();
+  console.log(`codexremotecontact chat hub: http://127.0.0.1:${process.env.PORT || 3789}`);
+  const clean = () => {
+    if (serviceLifecycle?.stopping) return;
+    void backgroundTask(Promise.all([pruneTransientFiles(codexTmpDir),
+      pruneTransientFiles(join(projectDir, 'tmp', 'private-images'))]))
+      .catch(() => console.error('Temporary-file cleanup incomplete; retained for next attempt'));
+  };
+  clean(); temporaryFilesTimer = setInterval(clean, 3600000); temporaryFilesTimer.unref();
 });
 
 async function runPrivateTask(text, skill, history, event = {}) {
   if (!isPrivateMemoryEvent(event) || !event.isOwner) throw Error('Private task requires an authenticated owner');
   await ensureCodexReplyWorkspace();
-  const outputPath = join(codexTmpDir, crypto.randomUUID() + '.qq-task.txt');
+  const outputPath = join(codexTmpDir, crypto.randomUUID() + '.private-task.txt');
+  const temporary = createTransientFiles(); let keepOutput = false;
+  try {
   const prompt = [
-    '你正在通过 QQ 管理员私聊执行任务。用中文汇报结果和验证情况。',
+    `你正在通过 PWA 管理员私聊执行任务。用中文汇报结果和验证情况。`,
     event.fullAccess ? '此任务由管理员确认使用完全访问。仅执行本次请求的操作，遵守本机策略和适用的权限约束。' : '仅在指定工作目录内修改文件。需要额外权限或外部发送时说明阻塞，不绕过沙箱。',
     '当前系统：' + process.platform + '；工作目录：' + localConfig.workspace,
-    process.platform === 'win32'
-      ? 'Windows 上使用 PowerShell 和 Windows 路径，不调用 AppleScript 或 macOS 命令。'
-      : 'Linux 上使用 bash 和 POSIX 路径，不调用 PowerShell、osascript 或 macOS 专有命令。',
+    'Windows 上使用 PowerShell 和 Windows 路径，不调用 AppleScript 或 macOS 命令。',
     skillContext(installedSkills, skill),
     await unifiedMemory.formatForPrompt({ scope: memoryScope(event), query: text }),
     '之前的任务对话（仅作上下文，不重新执行）：' + JSON.stringify(history),
@@ -5384,15 +5447,23 @@ async function runPrivateTask(text, skill, history, event = {}) {
     '-C', localConfig.workspace, '-o', outputPath];
   if (localConfig.remoteModel) args.push('-m', localConfig.remoteModel);
   args.push('-');
-  await runCodexCli(args, prompt, { budgetPurpose: 'qq-task', cwd: localConfig.workspace, timeout: 600000, env: { ...process.env } });
+  await runCodexCli(args, prompt, { budgetPurpose: 'qq-task', temporary, cwd: localConfig.workspace, timeout: 600000, env: { ...process.env } });
   const reply = (await readFile(outputPath, 'utf8')).trim();
   await unifiedMemory.write({ scope: memoryScope(event), type: 'projectNote', source: 'qq-cli-task',
     summary: `任务：${text.slice(0, 600)}\n结果：${reply.slice(0, 1200)}` });
-  return reply.length > 3500 ? reply.slice(0, 3300) + '\n\n完整结果：' + outputPath : reply || '任务结束，但未返回可读结果。';
+  keepOutput = reply.length > 3500;
+  return keepOutput ? reply.slice(0, 3300) + '\n\n完整结果（保留24小时）：' + outputPath : reply || '任务结束，但未返回可读结果。';
+  } finally {
+    if (!keepOutput) temporary.add(outputPath);
+    void backgroundTask(temporary.finish());
+  }
 }
 
 let activeEvents = 0;
-const messageBatches = new MessageBatches({ deliver: processOneBotEvent });
+const messageBatches = new MessageBatches({ deliver: processPrivateEvent,
+  // Backend controls (especially cancellation) must not wait for a chat model.
+  // Unknown slash messages may still become chat, so they stay in the queue.
+  isImmediate: payload => isHubCommand(normalizePrivatePayload(payload).text) });
 let timingLogWrites = Promise.resolve();
 function saveReplyTiming(record) {
   if (!record?.timings) return Promise.resolve();
@@ -5404,46 +5475,85 @@ function saveReplyTiming(record) {
     mergedInto: record.event.queueDisposition?.targetMessageId,
     recordedAt: new Date().toISOString(), timings: record.timings }) + '\n';
   const task = timingLogWrites.then(async () => {
-    const path = join(projectDir, 'runtime', 'logs', 'qq-timings.jsonl');
+    const path = join(projectDir, 'runtime', 'logs', 'private-timings.jsonl');
     await mkdir(join(projectDir, 'runtime', 'logs'), { recursive: true });
     const size = await stat(path).then(s => s.size).catch(() => 0);
     if (size > 2 * 1024 * 1024) await rename(path, path + '.previous');
     await appendFile(path, line);
   });
-  timingLogWrites = task.catch(() => { persistenceFailed = true; console.error('Could not save QQ timing diagnostics'); });
+  timingLogWrites = task.catch(() => { persistenceFailed = true; console.error('Could not save private timing diagnostics'); });
   return timingLogWrites;
 }
 let localConfigWrites = Promise.resolve();
 serviceLifecycle = createServiceLifecycle({
-  stopAccepting: () => new Promise((resolve, reject) => {
+  stopAccepting: () => Promise.all([pwaHttp?.close(), new Promise((resolve, reject) => {
     server.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve());
     server.closeIdleConnections?.();
-  }),
+  })]),
   stopBackground: () => {
+    videoSources.clear();
+    privateLearning?.stop();
+    clearInterval(pwaTimer); pwaTimer = null;
+    clearInterval(temporaryFilesTimer); temporaryFilesTimer = null;
     clearInterval(lifeTimer); lifeTimer = null;
     clearInterval(imessagePollTimer); imessagePollTimer = null;
     stopRemoteExecutionIdleTimer();
     if (hubCommands.shutdownTimer) clearTimeout(hubCommands.shutdownTimer);
-    return world?.close();
+    return Promise.all([pwaPush?.stop(), privateThoughtActions?.close(), spaceTimeline?.close(), spaceCommentReplies?.close(),
+      world?.close(), chatRetrieval.close(), publicTopicCatalog.close(), videoReader?.close()]);
   },
-  pending: () => activeEvents + activeHttpRequests + activeBackgroundTasks + activeCliProcesses + Number(imessagePolling),
+  pending: () => activeEvents + activeHttpRequests + activeBackgroundTasks + activeCliProcesses + Number(imessagePolling)
+    + (privateLearning?.pending() || 0),
   flush: async () => {
+    await flushPwaProjections();
     await Promise.all([localConfigWrites, timingLogWrites]);
-    try { await lifeConversation?.close(); await lifeBrowsing?.close(); await lifeProactive?.close(); await lifePlanner?.close(); await lifeReplies?.close(); await lifeContacts?.close(); }
-    finally { try { await lifeTimeline?.close(); } finally { await runtimeBudget.close(); } }
+    try { await lifeConversation?.close(); await lifeBrowsing?.close(); await lifeBrowseIntents?.close(); await lifeProactive?.close(); await lifePlanner?.close(); await lifeReplies?.close(); await lifeContacts?.close(); }
+    finally { try { await lifeTimeline?.close(); await privateLearning?.flush(); } finally { await runtimeBudget.close(); } }
+    pwaStore?.close();
     if (persistenceFailed) throw Error('A configuration or timing write failed');
   }
 });
 process.on('SIGTERM', () => { void serviceLifecycle.stop('SIGTERM'); });
 process.on('SIGINT', () => { void serviceLifecycle.stop('SIGINT'); });
-const hubCommands = new HubCommands({ config: localConfig, state, memory: unifiedMemory, world,
+const hubCommands = new HubCommands({ config: localConfig, state, memory: { ...unifiedMemory, clear: clearMemoryWithContactEvidence }, world,
   shutdown: () => serviceLifecycle.stop('/关机'),
   workspace: projectDir, saveSettings,
   persist: () => {
-    const task = localConfigWrites.then(() => writeFile(localConfigPath(projectDir), JSON.stringify(localConfig, null, 2)));
+    const task = localConfigWrites.then(() => writeJsonAtomic(join(dataDir, 'windows.local.json'), localConfig, { previous: true }));
     localConfigWrites = task.catch(() => { persistenceFailed = true; }); return task;
   }
 });
+if (pwaStore) {
+  const directory = pwaConfig.dataDirectory || join(dataDir, 'pwa');
+  const vapid = await loadOrCreateVapidConfig({ filePath: pwaConfig.vapidPath || join(directory, 'vapid.json'), subject: pwaConfig.origin });
+  pwaHistory = createPwaHistory({ store: pwaStore, readLegacyHistorySnapshot: options => unifiedMemory.readPwaHistory(options) });
+  pwaStickers = await createPwaStickers({ store: pwaStore, media: pwaMedia, sharedDirectory: state.privateChat.enhancer.enabled ? stickerDir : null });
+  pwaHttp = createPwaHttp({ store: pwaStore, auth: pwaAuth, media: pwaMedia, history: pwaHistory, stickers: pwaStickers,
+    spaceEnabled: pwaConfig.spaceEnabled === true,
+    publicDir: join(projectDir, 'modules', 'pwa', 'public'), origin: pwaConfig.origin,
+    onAccepted: () => schedulePwaWork(), pushPublicKey: vapid.publicKey, readOnly: pwaConfig.readOnly === true,
+    readLegacyHistory: options => unifiedMemory.readLegacyHistory(options) });
+  await flushPwaProjections();
+  for (const entry of pwaWritable() ? lifeReplies?.pwaRecoveryEntries?.() || [] : []) {
+    const event = { type: 'private_message', ...entry.sender, lifeReplyEpisodeId: entry.id,
+      raw: { batched_message_ids: entry.messages.map(message => message.id) } };
+    const delivery = pwaStore.getDelivery(`${privateLogicalReplyId(event, 'exchange')}:0`);
+    if (delivery) {
+      await lifeReplies.reconcilePwaDelivery({ episodeId: entry.id, sentMessageIds: delivery.messages.map(message => message.id) });
+    } else if (!pwaStore.hasPendingProjection(entry.scope)) {
+      await lifeContacts.recoverPwaIncoming(entry.lifeIncomingTokens || []);
+      await lifeReplies.recoverPwaDelivery(entry.id);
+    }
+  }
+  await pwaHttp.listen(Number(pwaConfig.port || 3790));
+  if (pwaWritable() && pwaConfig.pushEnabled !== false) {
+    pwaPush = createPwaPushWorker({ store: pwaStore, vapid, cachePath: join(directory, 'push-auth-cache.json') });
+    pwaPush.start();
+  }
+  pwaTimer = setInterval(schedulePwaWork, 1000); pwaTimer.unref();
+  schedulePwaWork();
+  console.log('Invitation private chat listener ready on loopback');
+}
 // Observation, planning and catch-up have independent in-flight guards: a slow
 // model cannot stop time advancing. Planning remains explicitly opt-in.
 if (lifeTimeline) {
@@ -5452,33 +5562,79 @@ if (lifeTimeline) {
   // within that window even when an activity is created by another writer.
   const interval = Number.isFinite(requestedInterval) ? Math.max(250, Math.min(15000, requestedInterval)) : 15000;
   lifeTimer = setInterval(() => {
-    if (lifeTickPending || serviceLifecycle.stopping) return;
+    if (lifeTickPending || serviceLifecycle.stopping || !lifeTimeline || lifeFailure && !lifeFailureRetryable) return;
     lifeTickPending = true;
     // A slow reply must not stop observation of the personal timeline. Track
     // the state tick and network/model drain independently during shutdown too.
     backgroundTask(lifeTimeline.tick()).then(() => {
+      // Only a recovered timeline write clears its own runtime suspension.
+      // Failed startup objects are null; reply-queue faults still need recovery.
+      if (lifeFailureRetryable) { lifeFailure = null; lifeFailureRetryable = false; }
       reportLifeWarnings();
       pumpLifeConversation();
-      if (!lifeActionsPending && !serviceLifecycle.stopping && (lifeBrowsing || lifeProactive)) {
-        lifeActionsPending = true;
-        backgroundTask(Promise.all([lifeBrowsing?.tick(), lifeProactive?.tick()]))
+      if (spaceTimeline && !spaceTickPending && !serviceLifecycle.stopping) {
+        const task = spaceTimeline.tick();
+        if (task) {
+          spaceTickPending = true;
+          backgroundTask(task).catch(() => console.error('Space publishing interrupted; timeline checkpoint retained'))
+            .finally(() => { spaceTickPending = false; });
+        }
+      }
+      if (spaceCommentReplies && !spaceCommentTickPending && !serviceLifecycle.stopping) {
+        spaceCommentTickPending = true;
+        backgroundTask(spaceCommentReplies.tick())
+          .catch(() => console.error('Space comment review interrupted'))
+          .finally(() => { spaceCommentTickPending = false; });
+      }
+      if (privateThoughtActions && !privateThoughtTickPending && !serviceLifecycle.stopping) {
+        privateThoughtTickPending = true;
+        backgroundTask(privateThoughtActions.tick())
+          .catch(() => { console.error('Private thought review interrupted'); })
+          .finally(() => { privateThoughtTickPending = false; });
+      }
+      // A committed reading may wait for wall time to catch up after rollback.
+      // Retry its local sinks independently, without another browser/model call
+      // or making a transient outbox failure disable ordinary life ticks.
+      const readingState = world?.lifeExperienceStatus();
+      if (!lifeExperiencePending && !serviceLifecycle.stopping && (readingState?.pending > 0 || readingState?.failed)) {
+        lifeExperiencePending = true;
+        backgroundTask(world.flushLifeExperiences())
           .then(() => pumpLifeConversation())
-          .catch(() => { persistenceFailed = true; console.error('Life action failed; durable claims preserved'); })
-          .finally(() => { lifeActionsPending = false; });
+          .catch(() => { console.error('Reading experience replay deferred; durable sources preserved'); })
+          .finally(() => { lifeExperiencePending = false; });
       }
       if (lifePlanner && !lifePlanningPending && !serviceLifecycle.stopping) {
         lifePlanningPending = true;
-        backgroundTask(lifePlanner.tick())
+        lifePlanningWork = backgroundTask(lifePlanner.tick())
           .then(() => pumpLifeConversation())
-          .catch(() => { persistenceFailed = true; console.error('Life planning persistence failed; stored state preserved'); })
+          .catch(() => { console.error('Life planning persistence failed; stored state preserved'); })
           .finally(() => { lifePlanningPending = false; });
+      }
+      if (!lifeActionsPending && !serviceLifecycle.stopping && (lifeBrowsing || lifeBrowseIntents)) {
+        lifeActionsPending = true;
+        // One reading lane shares world ownership. Ordinary planner gets its
+        // bounded call first, but its future nextAt never gates a new desire.
+        const planning = lifePlanningWork;
+        backgroundTask((async () => {
+          await lifeBrowsing?.tick();
+          await planning;
+          if (!serviceLifecycle.stopping && lifeAvailable()) await lifeBrowseIntents?.tick();
+        })()).then(() => pumpLifeConversation())
+          .catch(() => { console.error('Life reading action failed; durable claims preserved'); })
+          .finally(() => { lifeActionsPending = false; });
+      }
+      if (!lifeProactivePending && !serviceLifecycle.stopping && lifeProactive) {
+        lifeProactivePending = true;
+        backgroundTask(lifeProactive.tick()).then(() => pumpLifeConversation())
+          .catch(() => { console.error('Life contact action failed; durable claims preserved'); })
+          .finally(() => { lifeProactivePending = false; });
       }
       if (lifeDrainPending || serviceLifecycle.stopping) return;
       lifeDrainPending = true;
-      backgroundTask(lifeReplies.drain())
-        .catch(() => { persistenceFailed = true; console.error('Life reply drain failed; stored state preserved'); })
+      backgroundTask(lifeReplies?.drain())
+        .catch(() => { console.error('Life reply drain failed; stored state preserved'); })
         .finally(() => { lifeDrainPending = false; });
-    }).catch(() => { persistenceFailed = true; console.error('Life timeline tick failed; stored state preserved'); })
+    }).catch(error => { suspendLife(error, { retryable: true }); })
       .finally(() => { lifeTickPending = false; });
   }, interval);
 }
@@ -5492,18 +5648,19 @@ function reportLifeWarnings() {
 }
 
 function pumpLifeConversation() {
-  if (!lifeConversation || lifeConversationPending || serviceLifecycle?.stopping) return;
+  if (!lifeAvailable() || !lifeConversation || lifeConversationPending || serviceLifecycle?.stopping) return;
   lifeConversationPending = true;
   backgroundTask(lifeConversation.tick())
-    .catch(() => { persistenceFailed = true; console.error('Life conversation transition failed; stored claims preserved'); })
+    .catch(() => { console.error('Life conversation transition failed; stored claims preserved'); })
     .finally(() => { lifeConversationPending = false; });
 }
 
+function isLifeIncomingEligible(event) {
+  return isPrivateMemoryEvent(event) && pwaWritable() && pwaIdentityCurrent(event, pwaStore);
+}
+
 function isLifeContactEligible(event) {
-  const current = enrichQqEvent(event);
-  return state.channels.qq && isPrivateMemoryEvent(current)
-    && !/^\s*\//.test(current.text || '') && !isBannedQqSender(current)
-    && (localConfig.allowOtherPrivateChats === true || isMac || current.isOwner);
+  return isLifeIncomingEligible(event) && refreshPrivateEvent(event).backendCommand !== true;
 }
 
 // Only authenticated ingress constructs this evidence. Keep one bounded latest
@@ -5514,151 +5671,406 @@ function contactEvidenceFor(event, token) {
     .map(part => String(part.data?.text || '')).join('') : String(event.text || '').replace(/\[CQ:[^\]]*\]/gi, '');
   if (!text || text.length > 12000) return undefined;
   return { token: structuredClone(token), event: { type: 'private_message', senderId: String(event.senderId), text,
+    ...(isPwaEvent(event) ? { channel: 'pwa', privateIdentity: structuredClone(event.privateIdentity) } : {}),
     raw: { message_id: event.raw?.message_id, message: [{ type: 'text', data: { text } }] } } };
 }
 
 function contactEventFor(scope) {
-  return enrichQqEvent({ type: 'private_message', senderId: String(scope).replace(/^qq:private:/, ''), text: '', raw: {} });
+  const identity = pwaStore?.getIdentityForScope(scope);
+  if (identity?.preferredChannel === 'pwa') return refreshPrivateEvent(trustedPwaEvent({ type: 'private_message',
+    senderName: identity.displayName || '对方', text: '', raw: {} }, identity));
+  return { type: 'private_message', channel: 'unavailable', senderId: privateScopeId(scope), text: '', raw: {} };
+}
+
+async function recallReadingNotes(options) {
+  try { return await world?.recallNotes(options) || { text: '', sources: [] }; }
+  catch { console.error('Optional reading-note recall unavailable'); return { text: '', sources: [] }; }
+}
+
+async function readingNotesCurrent(refs = [], options = {}) {
+  if (!refs?.length) return true;
+  try { return await world?.validateNoteRefs(refs, options) === true; }
+  catch { return false; }
 }
 
 async function readLifeContactCandidate({ scope, motive }) {
-  const recalled = await unifiedMemory.recall({ scope, query: motive, limit: 2 });
+  if (!await awaitPrivateProjection(scope)) return null;
+  // Capture before any source read; taking a new epoch after recall could
+  // authorize text generated from memory that was cleared during the read.
+  const epochToken = await unifiedMemory.captureEpoch({ scope });
+  const recalled = await unifiedMemory.recall({ scope, query: motive, limit: 1, includeRecent: true });
+  const notes = await recallReadingNotes({ scope, query: [motive, recalled.context].filter(Boolean).join('\n'),
+    limit: 1, maxChars: 2800, excludeText: recalled.context, epochToken });
   const sources = recalled.entries.map(entry => ({ kind: 'private-memory', ref: `memory:${entry.id}`, scope }));
+  sources.push(...notes.sources);
   let context = '';
-  for (const block of [recalled.context, await unifiedMemory.formatPrivateProfile({ scope }),
-    personalLifeState.formatContext({ scope }), lifeTimeline.formatContext({ scope })]) {
+  for (const block of [notes.text, recalled.context, await unifiedMemory.formatPrivateProfile({ scope }),
+    personalLifeState.formatContext({ scope }), lifeTimeline.formatContext({ scope, excludeReading: true })]) {
     if (block && context.length + block.length + 1 <= 12000) context += (context ? '\n' : '') + block;
   }
-  return { sources, score: recalled.entries.filter(entry => entry.reason === 'relevant').length, context };
+  if (!await unifiedMemory.isEpochCurrent(epochToken)) return null;
+  return { sources, score: recalled.entries.filter(entry => entry.reason === 'relevant').length, context, epochToken };
 }
 
-async function decideLifeContact(input) {
-  const prompt = buildProactivePrompt(await loadAssistantSkillBrief(), input);
-  const model = localConfig.privateChatModel || localConfig.world?.model || (state.ai.model === 'default' ? undefined : state.ai.model);
-  const runner = createWorldModel({ directory: join(dataDir, 'life', 'contact-model'), model,
+async function runPrivateLearningModel({ prompt, timeoutMs, signal, schema = learningDecisionSchema }) {
+  if (serviceLifecycle?.stopping || !personaCurrent()) throw Error('Service or persona generation unavailable');
+  const model = localConfig.privateChatModel || (state.ai.model === 'default' ? undefined : state.ai.model);
+  const runner = createWorldModel({ directory: join(projectDir, 'runtime', 'private-learning-model'), model,
     reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort,
-    proxy: localConfig.codexProxy, schema: proactiveDecisionSchema, timeoutMs: 300000 });
-  const result = await runtimeBudget.run({ purpose: 'life-contact' }, () => runner({ prompt }));
+    proxy: localConfig.codexProxy, schema, timeoutMs });
+  return backgroundTask(runtimeBudget.run({ purpose: 'private-learning' }, () => {
+    if (serviceLifecycle?.stopping || !personaCurrent()) throw Error('Service or persona generation unavailable');
+    return runner({ prompt, signal });
+  }));
+}
+
+async function privateThoughtCurrent({ userId, scope, epoch }) {
+  if (serviceLifecycle?.stopping || !lifeAvailable() || !pwaWritable() || !personaCurrent()) throw Error('Private thought review unavailable');
+  const identity = pwaStore.getIdentity(userId);
+  return Boolean(identity?.enabled && identity.bindingStatus === 'active' && identity.memoryScope === scope
+    && identity.preferredChannel === 'pwa' && await unifiedMemory.isEpochCurrent({ scope, epoch }));
+}
+
+async function decidePrivateThought({ prompt, schema, scope, signal, canContinue }) {
+  const model = localConfig.privateChatModel || (state.ai.model === 'default' ? undefined : state.ai.model);
+  const runner = createWorldModel({ directory: join(projectDir, 'runtime', 'private-thought-model'), model, schema,
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort,
+    proxy: localConfig.codexProxy, timeoutMs: 120000 });
+  const profile = await loadAssistantSkillBrief();
+  const result = await runtimeBudget.run({ purpose: 'private-thought-review' }, async () => {
+    if (signal.aborted || !await canContinue()) throw Error('Private thought review interrupted');
+    const currentLife = lifeTimeline.formatContext({ scope, limit: 2, excludeReading: true });
+    const reading = state.privateChat.webLookup.enabled ? '目前已开启公开文章取材。' : '目前网页取材关闭。';
+    return runner({ prompt: [profile, currentLife, reading, prompt].filter(Boolean).join('\n\n'), signal });
+  });
   return result.text;
 }
 
+async function decideInSpace(purpose, { prompt, schema, signal, canContinue }) {
+  const model = localConfig.privateChatModel || (state.ai.model === 'default' ? undefined : state.ai.model);
+  const invoke = createWorldModel({ directory: join(projectDir, 'runtime', purpose + '-model'), model, schema,
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort,
+    proxy: localConfig.codexProxy, timeoutMs: 120000 });
+  const profile = await loadAssistantSkillBrief();
+  const result = await runtimeBudget.run({ purpose }, () => {
+    signal.throwIfAborted();
+    if (!canContinue()) throw Error('Space decision interrupted');
+    return invoke({ prompt: [profile, prompt].filter(Boolean).join('\n\n'), signal });
+  });
+  return result.text;
+}
+
+async function decideLifeBrowseIntent(context, { canContinue = () => true } = {}) {
+  if (!personaCurrent()) throw Error('Persona revision changed');
+  const prompt = buildLifeBrowseIntentPrompt(await loadAssistantSkillBrief(), { ...context, capabilities: currentRuntimeCapabilities({ entry: 'browse' }) });
+  const model = localConfig.world?.model || localConfig.privateChatModel || (state.ai.model === 'default' ? undefined : state.ai.model);
+  const runner = createWorldModel({ directory: join(dataDir, 'life', 'browse-intent-model'), model,
+    reasoningEffort: localConfig.world?.reasoningEffort || state.ai.reasoningEffort,
+    proxy: localConfig.codexProxy, schema: browseIntentDecisionSchema, timeoutMs: 180000 });
+  const result = await runtimeBudget.run({ purpose: 'life-browse-intent' }, async () => {
+    if (serviceLifecycle?.stopping || !lifeAvailable() || !await canContinue() || !personaCurrent()) throw Error('Life browsing is unavailable');
+    return runner({ prompt });
+  });
+  if (!personaCurrent()) throw Error('Persona revision changed');
+  return result.text;
+}
+
+async function submitDeliveredBrowseIntent(event, sent, { durable = false } = {}) {
+  if (durable && event.lifeBrowseIntent && browseIntentsEnabled
+    && (!lifeBrowseIntents || lifeBrowseIntents.diagnostics().failed)) {
+    throw Object.assign(Error('Browsing intent storage needs recovery'), { code: 'projection-browse-unavailable' });
+  }
+  if (!personaCurrent() || !browseIntentsAvailable() || !event.lifeBrowseIntent || event.hubPreview || event.backendCommand === true
+    || sent?.ok !== true || sent.textComplete === false || !event.sentMessageIds?.length
+    || !isCurrentLifeReply(event) || !event.memoryEpochToken) return { ok: true, skipped: true };
+  const ids = event.raw?.batched_message_ids || [event.raw?.message_id];
+  if (!Array.isArray(ids) || !ids.length || ids.some(id => id == null || !String(id))) return { ok: true, skipped: true };
+  const scope = memoryScope(event);
+  // The scope and real incoming batch identify the proposal across restarts.
+  // Hashing bounds the ref; it denotes incoming evidence, never a fake memory.
+  const batch = createHash('sha256').update(JSON.stringify([scope, ids.map(String)])).digest('hex');
+  try {
+    const result = await lifeBrowseIntents.submit({ id: `chat:${batch}`, scope, ...event.lifeBrowseIntent,
+      sourceRefs: [`incoming:${batch}`], epochToken: event.memoryEpochToken });
+    if (durable && !result.accepted && !result.duplicate && result.reason !== 'stale-epoch') {
+      throw Object.assign(Error('Browsing intent projection did not commit'), { code: 'projection-browse-incomplete' });
+    }
+    return result;
+  } catch (error) {
+    if (durable) throw error;
+    console.error('Could not save delivered reply browsing intent');
+  }
+}
+
+async function decideLifeContact(input, options = {}) {
+  const route = capturePrivateRoute(contactEventFor(input.scope));
+  if (!await awaitPrivateProjection(input.scope)) throw Error('Private projection interrupted');
+  lifeGenerationRoutes.set(options.selectionKey, route);
+  if (lifeGenerationRoutes.size > 256) lifeGenerationRoutes.delete(lifeGenerationRoutes.keys().next().value);
+  const personaToken = personaPolicy?.capture();
+  let experienceCurrent = async () => true;
+  let retrievalResult = null;
+  const assertCurrent = async () => {
+    personaPolicy?.assertCurrent(personaToken);
+    if (retrievalResult) await chatRetrieval.assertResultCurrent(retrievalResult);
+    if (serviceLifecycle?.stopping || !privateInputCurrent(route) || !isLifeContactEligible(route) || !await unifiedMemory.isEpochCurrent(options.epochToken)
+      || options.canContinue && !await options.canContinue() || !await experienceCurrent()) throw Error('Proactive reply no longer current');
+    personaPolicy?.assertCurrent(personaToken);
+  };
+  await assertCurrent();
+  lifeGenerationValidity.set(options.selectionKey, assertCurrent);
+  if (lifeGenerationValidity.size > 256) lifeGenerationValidity.delete(lifeGenerationValidity.keys().next().value);
+  const learned = await privateLearning?.formatContext({ scope: input.scope, userText: input.thought?.text || '',
+    paused: lifeContacts?.isPaused(input.scope) === true, proactive: true,
+    selectionKey: options.selectionKey, deferSelection: (commit, material) => {
+      if (material) {
+        lifeGenerationSelections.set(options.selectionKey, material);
+        if (lifeGenerationSelections.size > 256) lifeGenerationSelections.delete(lifeGenerationSelections.keys().next().value);
+      }
+      options.deferSelection?.(commit, material);
+    },
+    deferValidity: guard => { experienceCurrent = guard; } }) || '';
+  const profile = await loadAssistantSkillBrief();
+  input = { ...input, context: [input.context, learned].filter(Boolean).join('\n') };
+  const capabilityText = currentCapabilityText(route, { entry: 'proactive' });
+  const creativeKinds = creativeKindsFor(route);
+  const creativePrompt = creativeDecisionPrompt(creativeKinds);
+  const prompt = [capabilityText, sharedReplyContract(), buildProactivePrompt(profile, input), creativePrompt].filter(Boolean).join('\n\n');
+  const sourceOptions = { sources: input.sources, motiveRef: input.motiveRef, scope: input.scope };
+  const finish = async decision => {
+    const reply = decision.creativeWork
+      ? await makePrivateWork(route, creativeBinding(route, outboundLogicalId(input.scope, options.selectionKey), options.epochToken, personaToken), decision.creativeWork, assertCurrent)
+      : decision.reply;
+    return JSON.stringify({ reply, sourceRefs: decision.sourceRefs });
+  };
+  const caller = { model: localConfig.privateChatModel || localConfig.world?.model || (state.ai.model === 'default' ? undefined : state.ai.model),
+    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort };
+  if (state.privateChat.webLookup.enabled === true) {
+    return withCurrentReplySignal(assertCurrent, async ({ signal, assertCurrent: current }) => {
+      const topics = await prepareChatPublicTopics({ text: [input.thought?.text, input.context].filter(Boolean).join('\n'),
+        signal, assertCurrent: current });
+      let evidence = '';
+      for (let generation = 0; generation < 2; generation++) {
+        const allowLookup = generation === 0 && topics.length > 0;
+        const lookupPrompt = capabilityText + '\n\n' + sharedReplyContract() + '\n\n'
+          + buildProactiveRetrievalPrompt(profile, input, { topics, allowLookup, evidence }) + '\n' + creativePrompt;
+        const runner = createWorldModel({ directory: join(dataDir, 'life', 'contact-model'), ...resolveReplyWriter(replySettings, caller),
+          proxy: localConfig.codexProxy, schema: withCreativeSchema(proactiveRetrievalSchema, creativeKinds), timeoutMs: 300000 });
+        const result = await backgroundTask(runtimeBudget.run({ purpose: generation ? 'life-contact-lookup' : 'life-contact' },
+          () => measureModelCall(async () => { await current(); return runner({ prompt: lookupPrompt, signal }); })));
+        await current();
+        const decision = readCreativeDecision(result.text, creativeKinds,
+          value => parseProactiveRetrieval(value, { topics, allowLookup, ...sourceOptions }));
+        if (decision.action === 'reply') return finish(decision);
+        const retrieved = await retrieveChatEvidence({
+          request: { version: 1, id: crypto.randomUUID(), turnId: options.selectionKey,
+            scope: { kind: 'private', contactId: input.scope, memoryEpoch: options.epochToken?.epoch }, publicQuery: decision.lookup },
+          topics, signal, assertCurrent: current });
+        retrievalResult = retrieved;
+        route.chatEvidenceValidity = () => chatRetrieval.assertResultCurrent(retrieved);
+        await current();
+        evidence = formatRetrievalEvidence(retrieved);
+        state.maintenance.webLookup.lastQuery = null;
+        state.maintenance.webLookup.lastRunAt = new Date().toISOString();
+        state.maintenance.webLookup.lastOk = ['ok', 'partial'].includes(retrieved.status);
+        state.maintenance.webLookup.lastError = retrieved.errorCode || null;
+        state.maintenance.webLookup.lastDurationMs = retrieved.metrics?.http?.durationMs ?? retrieved.metrics?.durationMs ?? null;
+      }
+      throw Error('Proactive lookup did not produce a final decision');
+    });
+  }
+  if (replySettings.mode === 'two-stage') {
+    const raw = await generateLifePlannedReply({ mode: 'proactive', prompt, input, caller, assertCurrent, profile, capabilityText, creativeKinds });
+    return finish(readCreativeDecision(raw, creativeKinds, value => parseProactiveDecision(value, sourceOptions)));
+  }
+  const runner = createWorldModel({ directory: join(dataDir, 'life', 'contact-model'), ...resolveReplyWriter(replySettings, caller),
+    proxy: localConfig.codexProxy, schema: withCreativeSchema(proactiveDecisionSchema, creativeKinds), timeoutMs: 300000 });
+  const result = await runtimeBudget.run({ purpose: 'life-contact' }, async () => { await assertCurrent(); return runner({ prompt }); });
+  await assertCurrent();
+  return finish(readCreativeDecision(result.text, creativeKinds, value => parseProactiveDecision(value, sourceOptions)));
+}
+
 async function readLifeConversationContext({ scope, event, thought }) {
+  if (!await awaitPrivateProjection(scope)) throw Error('Private projection interrupted');
+  const epochToken = await unifiedMemory.captureEpoch({ scope });
   const recalled = await unifiedMemory.recall({ scope,
     query: [event.text, thought.text].filter(Boolean).join('\n'), limit: 4 });
   let context = '';
   for (const block of [recalled.context, await unifiedMemory.formatPrivateProfile({ scope }),
-    personalLifeState.formatContext({ scope }), lifeTimeline.formatContext({ scope })]) {
+    personalLifeState.formatContext({ scope }), lifeTimeline.formatContext({ scope, excludeReading: true })]) {
     if (block && context.length + block.length + 1 <= 12000) context += (context ? '\n' : '') + block;
   }
-  return { context, sources: recalled.entries.slice(0, 4).map(entry => ({ kind: 'private-memory', ref: `memory:${entry.id}`, scope })) };
+  if (!await unifiedMemory.isEpochCurrent(epochToken)) throw Error('Conversation memory epoch changed');
+  return { context, epochToken, sources: recalled.entries.slice(0, 4).map(entry => ({ kind: 'private-memory', ref: `memory:${entry.id}`, scope })) };
 }
 
-async function decideLifeConversation(input) {
-  const prompt = buildConversationPrompt(await loadAssistantSkillBrief(), input);
-  const model = localConfig.privateChatModel || localConfig.world?.model || (state.ai.model === 'default' ? undefined : state.ai.model);
-  const runner = createWorldModel({ directory: join(dataDir, 'life', 'conversation-model'), model,
-    reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort,
-    proxy: localConfig.codexProxy, schema: conversationDecisionSchema, timeoutMs: 25000 });
-  const result = await backgroundTask(runtimeBudget.run({ purpose: 'life-conversation' }, () => {
-    // Quota admission can wait. Recheck at the actual model boundary, after
-    // that wait, so an expired comparison never starts a new model process.
+async function decideLifeConversation(input, options = {}) {
+  const route = capturePrivateRoute(contactEventFor(input.scope));
+  if (!await awaitPrivateProjection(input.scope)) throw Error('Private projection interrupted');
+  lifeGenerationRoutes.set(input.decisionId, route);
+  if (lifeGenerationRoutes.size > 256) lifeGenerationRoutes.delete(lifeGenerationRoutes.keys().next().value);
+  const deadline = Math.min(input.deadline, Date.now() + 25000);
+  const personaToken = personaPolicy?.capture();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, deadline - Date.now()));
+  const event = { replyTurn: { signal: controller.signal } };
+  const assertCurrent = async () => {
+    personaPolicy?.assertCurrent(personaToken);
+    if (!await unifiedMemory.isEpochCurrent(options.epochToken)) throw Object.assign(Error('Conversation memory epoch changed'), { code: 'CONVERSATION_CHANGED' });
     const plan = lifeTimeline.snapshot().plans.find(item => item.id === input.plan.id);
     const current = lifeContacts.capture(input.scope);
     const choice = lifeConversation.snapshot(input.scope).choices.find(item => item.id === input.decisionId);
-    if (serviceLifecycle?.stopping || plan?.status !== 'planned' || plan.startTransition?.status !== 'pending'
+    if (controller.signal.aborted || serviceLifecycle?.stopping || !privateInputCurrent(route) || !isLifeContactEligible(route)
+      || plan?.status !== 'planned' || plan.startTransition?.status !== 'pending'
       || plan.startTransition.id !== input.decisionId || Date.now() < plan.startTransition.claimedAt
-      || Date.now() >= input.deadline || current?.epoch !== input.token.epoch || current?.sequence !== input.token.sequence
+      || Date.now() >= deadline || current?.epoch !== input.token.epoch || current?.sequence !== input.token.sequence
       || choice?.status !== 'generating' || !lifeContacts.isCurrent(input.token, { latest: true }) || !isLifeContactEligible(contactEventFor(input.scope))) {
-      throw Error('Conversation choice is no longer current');
+      throw Object.assign(Error('Conversation choice is no longer current'), { code: controller.signal.aborted || Date.now() >= deadline ? 'CONVERSATION_TIMEOUT' : 'CONVERSATION_CHANGED' });
     }
-    return runner({ prompt });
-  }));
-  return result.text;
+    personaPolicy?.assertCurrent(personaToken);
+  };
+  try {
+    await assertCurrent();
+    await privateLearning?.initialize(input.scope).catch(() => {});
+    const profile = await loadAssistantSkillBrief();
+    const capabilityText = currentCapabilityText(route, { entry: 'conversation' });
+    const prompt = capabilityText + '\n\n' + sharedReplyContract() + '\n\n' + buildConversationPrompt(profile, input);
+    const caller = { model: localConfig.privateChatModel || localConfig.world?.model || (state.ai.model === 'default' ? undefined : state.ai.model),
+      reasoningEffort: localConfig.privateChatReasoningEffort || state.ai.reasoningEffort };
+    if (replySettings.mode === 'two-stage') {
+      return await generateLifePlannedReply({ mode: 'conversation', prompt, input, caller, assertCurrent, profile, event, deadline, capabilityText });
+    }
+    const result = await backgroundTask(runtimeBudget.run({ purpose: 'life-conversation' }, async () => {
+      await assertCurrent();
+      const runner = createWorldModel({ directory: join(dataDir, 'life', 'conversation-model'), ...resolveReplyWriter(replySettings, caller),
+        proxy: localConfig.codexProxy, schema: conversationDecisionSchema, timeoutMs: deadline - Date.now() });
+      return runner({ prompt, signal: controller.signal });
+    }));
+    await assertCurrent(); return result.text;
+  } finally { clearTimeout(timer); }
 }
 
-async function dispatchLifeConversation({ decisionId, scope, token, text, guard }) {
-  const event = contactEventFor(scope);
-  const result = await inReplyOrder(`private:${event.senderId}`, () => lifeContacts.sendIfCurrent(token, () => {
-    if (serviceLifecycle?.stopping || !isLifeContactEligible(event) || !guard()) return { ok: false, reason: 'life-choice-expired' };
-    return sendOneBotSegments('private', Number(event.senderId), [{ type: 'text', data: { text } }]);
-  }));
-  if (result?.ok) {
-    try { await unifiedMemory.writeOutbound({ scope, replyText: text, intentId: `life-conversation:${decisionId}`,
-      sentMessageIds: result.body?.data?.message_id == null ? [] : [String(result.body.data.message_id)] }); }
-    catch { persistenceFailed = true; console.error('Could not save delivered activity farewell'); }
+async function generateLifePlannedReply({ mode, prompt, input, caller, assertCurrent, profile, event, deadline = Infinity, capabilityText = '', creativeKinds = [] }) {
+  const evidence = createReplyEvidence([{ kind: 'life-source', text: JSON.stringify(input), scope: input.scope }], { scope: input.scope });
+  const context = { mode, creativeKinds, scope: input.scope, evidence, runtimeCapabilities: capabilityText, plainText: true, sources: input.sources,
+    motiveRef: input.motiveRef, canDefer: input.canDefer === true, maxChars: mode === 'conversation' ? 300 : 900 };
+  const result = await runReplyRole({ role: 'planner', prompt: prompt + '\n本轮原始资料编号：\n' + JSON.stringify(evidence) + '\n' + replyPlanPrompt(context),
+    schema: replyPlanSchema(context), caller, event, assertCurrent, deadline });
+  const plan = parseReplyPlan(result.text, context);
+  let text = '';
+  if (plan.utterance) {
+    const writer = await runReplyRole({ role: 'writer', prompt: buildWriterPrompt({ ...context, profile, plan,
+      current: mode === 'proactive' ? '这是主动联系，对方没有发来新消息。' : '这是对当前对象的活动暂离选择，不能预告已完成活动。' }),
+      schema: writerReplySchema, caller, event, assertCurrent, deadline });
+    text = parseWriterReply(writer.text, { maxChars: context.maxChars, requiredLiterals: plan.utterance.requiredLiterals }).text;
   }
+  await assertCurrent(); return JSON.stringify(assembleReply(plan, text, context));
+}
+
+async function dispatchLifeConversation({ decisionId, scope, token, text, guard, epochToken }) {
+  const event = lifeGenerationRoutes.get(decisionId);
+  if (!event || !privateInputCurrent(event)) return { ok: false, reason: 'life-route-or-input-changed' };
+  const result = await inReplyOrder(privateQueueKey(event), () => lifeContacts.sendIfCurrent(token, () => unifiedMemory.withEpoch(epochToken, () => {
+    if (!personaCurrent() || serviceLifecycle?.stopping || !privateInputCurrent(event) || !isLifeContactEligible(event) || !guard()) return { ok: false, reason: 'life-choice-expired' };
+    return dispatchPrivateSegments(event, [{ type: 'text', data: { text } }], { kind: 'outbound', intentId: `life-conversation:${decisionId}`, decisionId, epochToken });
+  })));
+  if (isPwaEvent(event)) { pwaActiveLogical.delete(event.pwaLogicalReplyId); await flushPwaProjections(); }
+  lifeGenerationRoutes.delete(decisionId);
   return result;
 }
 
-async function dispatchLifeContact({ ticket, scope, guard }) {
-  const event = contactEventFor(scope);
-  let sentText, sentId;
-  const result = await inReplyOrder(`private:${event.senderId}`, () => lifeContacts.dispatch(ticket, text => {
-    sentText = text;
-    return sendOneBotSegments('private', Number(event.senderId), [{ type: 'text', data: { text } }]).then(sent => {
-      sentId = sent.body?.data?.message_id; return sent;
-    });
-  }, { guard: () => !serviceLifecycle.stopping && isLifeContactEligible(event) && guard() }));
-  if (result.ok) {
-    // This is our initiative, not a fictional user turn or profile evidence.
-    try { await unifiedMemory.writeOutbound({ scope, replyText: sentText, intentId: ticket.id,
-      sentMessageIds: sentId == null ? [] : [String(sentId)] }); }
-    catch { persistenceFailed = true; console.error('Could not save delivered proactive private memory'); }
-  }
+async function dispatchLifeContact({ ticket, scope, guard, epochToken, noteRefs = [] }) {
+  const event = lifeGenerationRoutes.get(ticket.id);
+  if (!event || !privateInputCurrent(event)) return { ok: false, reason: 'life-route-or-input-changed' };
+  event.learningSelectionMaterial = lifeGenerationSelections.get(ticket.id);
+  const validateGeneration = lifeGenerationValidity.get(ticket.id);
+  const generationCurrent = async () => { try { if (!personaCurrent() || !validateGeneration) return false; await validateGeneration(); return true; } catch { return false; } };
+  const result = await inReplyOrder(privateQueueKey(event), () => lifeContacts.dispatch(ticket, text => unifiedMemory.withEpoch(epochToken, async () => {
+    if (!await generationCurrent() || serviceLifecycle?.stopping || !isLifeContactEligible(event) || !guard()) return { ok: false, reason: 'life-choice-expired' };
+    if (!await readingNotesCurrent(noteRefs, { scope, epochToken })) return { ok: false, reason: 'note-source-changed' };
+    if (!await generationCurrent() || serviceLifecycle?.stopping || !isLifeContactEligible(event) || !guard()) return { ok: false, reason: 'life-choice-expired' };
+    return dispatchPrivateSegments(event, [{ type: 'text', data: { text } }], { kind: 'outbound', intentId: ticket.id, epochToken });
+  }), { guard: () => personaCurrent() && Boolean(validateGeneration) && !serviceLifecycle.stopping && isLifeContactEligible(event) && guard() }));
+  discardCancelledWork(event, result?.reason);
+  if (isPwaEvent(event)) { pwaActiveLogical.delete(event.pwaLogicalReplyId); await flushPwaProjections(); }
+  lifeGenerationValidity.delete(ticket.id);
+  lifeGenerationSelections.delete(ticket.id);
+  lifeGenerationRoutes.delete(ticket.id);
   return result;
 }
 
 function isLifeReplyEligible(event) {
-  return isLifeContactEligible(event) && !hasUnhandledQqAudio(event);
+  return isLifeContactEligible(event);
 }
 
-async function resumeLifeReply(queuedEvent, { resumeContext, episodeId } = {}) {
-  const event = enrichQqEvent({ ...queuedEvent, lifeResumeContext: [resumeContext,
-    '这是忙碌期间消息的一次合并回应。可以只自然提一句当前情况；无需逐条回答。只输出一条简短文字，不使用图片、表情附件或补查标记。'
+async function resumeLifeReply(queuedEvent, { resumeContext, episodeId, markSending } = {}) {
+  let event = refreshPrivateEvent({ ...queuedEvent, lifeResumeContext: [resumeContext,
+    isPwaEvent(queuedEvent) ? '这是忙碌期间消息的一次合并回应。可按需查询一次原文后自然回应，最终只输出一条简短文字，不使用图片或表情附件。' : '这是忙碌期间消息的一次合并回应。可以只自然提一句当前情况；无需逐条回答。只输出一条简短文字，不使用图片、表情附件或补查标记。'
   ].filter(Boolean).join('\n') });
-  if (!isLifeReplyEligible(event) || !isCurrentLifeReply(event)) return { ok: false };
+  if (!isLifeReplyEligible(event)) return { ok: false, reason: 'ineligible' };
+  if (!await awaitPrivateProjection(memoryScope(event))) return { ok: false, reason: 'service-stopping' };
+  if (!privateInputCurrent(event)) return { ok: false, reason: 'new-input-accepted' };
+  if (!isCurrentLifeReply(event)) return { ok: false, reason: 'contact-stopped-or-stale' };
+  if (!await unifiedMemory.isEpochCurrent(event.memoryEpochToken)) return { ok: false, reason: 'memory-epoch-changed' };
+  if (!lifeContacts.canReplyIncoming(event.lifeIncomingTokens)) return { ok: false, reason: 'incoming-already-consumed-or-stale' };
+  if (isPwaEvent(event)) {
+    const rows = currentPwaImageInbox(pwaStore, event);
+    event = await attachReplyContext({ ...event, pwaReplyRefs: rows.map(row => row.replyTo).filter(Boolean) });
+    event = restorePwaBusyInput(rows, event);
+  }
+  event.lifeMarkSending = markSending;
+  event.learningConversation = true;
   event.lifeReplyTicket = lifeConversation?.beginReply(event);
   const timing = createReplyTiming();
   const record = { id: crypto.randomUUID(), receivedAt: new Date().toISOString(), source: 'life-resume',
     episodeId, event, decision: { ok: true, status: '生成中' }, timings: timing, reply: null, send: null, error: null };
-  state.qq.events.unshift(record); state.qq.events = state.qq.events.slice(0, 30);
+  state.privateChat.events.unshift(record); state.privateChat.events = state.privateChat.events.slice(0, 30);
   return replyTimingContext.run(timing, async () => {
-    let sendStarted = false;
     try {
       const reply = await buildModelReply(event);
-      record.reply = stripQqImageAttachmentMarkers(reply).trim();
-      if (!record.reply) record.reply = '现在有空了，刚才的消息我看到了。';
+      record.reply = stripImageAttachmentMarkers(reply).trim();
+      if (!record.reply) {
+        record.reply = '现在有空了，刚才的消息我看到了。';
+        event.privateThought = null;
+      }
       // Permissions may have changed while the model was running. Do not send
       // queued messages to a disabled channel or newly excluded contact.
-      if (!isCurrentLifeReply(event) || lifeTimeline.availability({ scope: memoryScope(event) }).busy) return { ok: false };
+      if (!isCurrentLifeReply(event)) return { ok: false, reason: 'contact-stopped-or-stale' };
+      if (!lifeAvailable() || lifeTimeline.availability({ scope: memoryScope(event) }).busy) return { ok: false, reason: 'life-unavailable' };
       record.decision.status = '发送中';
-      sendStarted = true;
-      record.send = await measureSend(timing, () => inReplyOrder(`private:${event.senderId}`, () =>
-        sendCurrentPrivateSegments(event, [{ type: 'text', data: { text: record.reply } }])));
+      record.send = await measureSend(timing, () => inReplyOrder(privateQueueKey(event), async () =>
+        sendRetrievalExpiryFallback(event, await sendCurrentPrivateSegments(event, [{ type: 'text', data: { text: record.reply } }], true))));
+      if (event.retrievalFallbackText) record.reply = event.retrievalFallbackText;
+      await finishPrivateIncoming(event, record.send);
       if (record.send?.ok) {
         const sentId = record.send.body?.data?.message_id;
         if (sentId != null) event.sentMessageIds = [String(sentId)];
-        try { await moodState.commit(event); }
-        catch { persistenceFailed = true; record.moodSaved = false; console.error('Could not save completed life reply mood'); }
-        try { await rememberQqExchange(event, record.reply); }
-        catch { persistenceFailed = true; record.memorySaved = false; console.error('Could not save completed life reply memory'); }
+        if (isPwaEvent(event)) { pwaActiveLogical.delete(event.pwaLogicalReplyId); await flushPwaProjections(); }
       }
-      return { ok: record.send?.ok === true };
+      return { ok: record.send?.ok === true, uncertain: record.send?.uncertain === true || event.lifeDeliveryUncertain === true,
+        reason: record.send?.reason, sentMessageIds: event.sentMessageIds || [] };
     } catch (error) {
+      if (error.code === 'MEMORY_EPOCH_CHANGED') {
+        record.reply = null;
+        record.decision.reason = 'memory-epoch-changed';
+        return { ok: false, reason: 'memory-epoch-changed', sentMessageIds: [] };
+      }
       record.error = publicFailure(error);
-      if (error.code === 'RUNTIME_BUDGET_BLOCKED' && !sendStarted && isCurrentLifeReply(event)
-        && !lifeTimeline.availability({ scope: memoryScope(event) }).busy) {
+      if (error.code === 'RUNTIME_BUDGET_BLOCKED' && !event.lifeTransportStarted && isCurrentLifeReply(event)
+        && lifeAvailable() && !lifeTimeline.availability({ scope: memoryScope(event) }).busy) {
         // One local status response replaces the single failed catch-up attempt.
         // It is not a personal experience or a conversation-memory entry.
-        sendStarted = true;
         record.reply = record.error;
         try {
-          record.send = await measureSend(timing, () => inReplyOrder(`private:${event.senderId}`, () =>
+          record.send = await measureSend(timing, () => inReplyOrder(privateQueueKey(event), () =>
             sendCurrentPrivateSegments(event, [{ type: 'text', data: { text: record.reply } }])));
-        } catch { /* The pending attempt is already consumed; never resend. */ }
+        } catch { event.lifeDeliveryUncertain = event.lifeTransportStarted === true; }
       }
-      return { ok: false, uncertain: sendStarted };
+      return { ok: record.send?.ok === true, uncertain: event.lifeDeliveryUncertain === true,
+        reason: record.send?.reason || 'reply-generation-or-send-failed', sentMessageIds: event.sentMessageIds || [] };
     } finally {
+      await finishPrivateIncoming(event, record.send || { ok: false, uncertain: event.lifeDeliveryUncertain === true });
+      pwaActiveLogical.delete(event.pwaLogicalReplyId);
       lifeConversation?.endReply(event.lifeReplyTicket);
       record.decision.status = record.send?.ok ? '已回复' : '回复失败';
       record.completedAt = new Date().toISOString();
@@ -5667,113 +6079,184 @@ async function resumeLifeReply(queuedEvent, { resumeContext, episodeId } = {}) {
   });
 }
 
-async function processOneBotEvent(payload, context = {}) {
-    const timing = createReplyTiming(payload.hubReceivedAt, payload.hubBatchCompletedAt);
-    return replyTimingContext.run(timing, () => processTimedOneBotEvent(payload, timing, context));
+async function processPrivateEvent(payload, context = {}) {
+    const timing = createReplyTiming(payload.hubReceivedAt, payload.hubBatchCompletedAt, payload.hubQueueStartedAt);
+    return replyTimingContext.run(timing, () => processTimedPrivateEvent(payload, timing, context));
 }
-async function processTimedOneBotEvent(payload, timing, context) {
-    if (payload.post_type !== 'message' || payload.message_type !== 'private' || payload.group_id != null) return { ignored: true, reason: 'Private-only mode' };
+async function processTimedPrivateEvent(payload, timing, context) {
+    if (context?.channel !== 'pwa' || payload.group_id != null) return { ignored: true, reason: 'Private-only mode' };
 
-    let event = enrichQqEvent(normalizeOneBotEvent(payload));
+    let event = normalizePrivateEvent(payload, context);
+    if (!isPwaEvent(event)) event.pwaScopeGeneration = context.pwaScopeGeneration;
+    if (!await awaitPrivateProjection(memoryScope(event))) return { status: 'ok', ignored: true, reason: 'service-stopping' };
+    const durableTokens = context.lifeIncomingTokens || [];
+    const durableById = new Map(durableTokens.map(token => [lifeContacts?.incomingMessageId(token), token]));
+    const incomingToken = item => item.message_id == null && durableTokens.length === 1 ? durableTokens[0]
+      : durableById.get(String(item.message_id));
+    const trackedIncoming = Boolean(lifeContacts && durableTokens.length);
     // Check each original message. A retry of the first item must not discard
     // subsequent new messages gathered by the short batching window.
     let duplicate;
     if (payload.hubBatchMessages?.length) {
-      const fresh = payload.hubBatchMessages.filter(item => !rememberEvent(getEventDedupeKey({ ...event, raw: item })));
+      // Only the internal turn coordinator may retain already-admitted inputs
+      // when replacing an unsent draft. Callback fields cannot grant replay.
+      const fresh = payload.hubBatchMessages.filter(item => trackedIncoming
+        ? lifeContacts.canReplyIncoming([incomingToken(item)])
+        : context.replyTurn?.admittedIds.has(String(item.message_id)) || !rememberEvent(getEventDedupeKey({ ...event, raw: item })));
+      if (trackedIncoming) context.lifeIncomingTokens = fresh.map(incomingToken);
+      context.replyTurn?.admit(fresh.map(item => item.message_id));
       duplicate = fresh.length === 0;
       if (!duplicate) {
         payload = { ...payload, message_id: fresh[0].message_id, hubBatchMessages: fresh,
           batched_message_ids: fresh.map(item => item.message_id),
           message: fresh.flatMap((item, index) => [...(index ? [{ type: 'text', data: { text: '\n' } }] : []), ...item.message]),
           raw_message: fresh.every(item => typeof item.raw_message === 'string') ? fresh.map(item => item.raw_message).join('\n') : undefined };
-        event = enrichQqEvent(normalizeOneBotEvent(payload));
+        event = normalizePrivateEvent(payload, context);
+        if (!isPwaEvent(event)) event.pwaScopeGeneration = context.pwaScopeGeneration;
       }
-    } else duplicate = rememberEvent(getEventDedupeKey(event));
+    } else duplicate = trackedIncoming ? !lifeContacts.canReplyIncoming(durableTokens) : rememberEvent(getEventDedupeKey(event));
     if (duplicate) {
       const record = {
         id: crypto.randomUUID(),
         receivedAt: new Date().toISOString(),
-        source: "onebot",
+        source: "pwa",
         event,
-        decision: { ok: false, status: '忽略', reason: "Duplicate OneBot message ignored" },
+        decision: { ok: false, status: '忽略', reason: trackedIncoming && !lifeContacts.isCurrent(context.contactToken)
+          ? 'contact-epoch-superseded' : 'Duplicate private message ignored' },
         timings: timing,
         completedAt: new Date().toISOString(),
         reply: null,
         error: null,
         send: null
       };
-      state.qq.events.unshift(record);
-      state.qq.events = state.qq.events.slice(0, 30);
+      state.privateChat.events.unshift(record);
+      state.privateChat.events = state.privateChat.events.slice(0, 30);
       await saveReplyTiming(record);
       return ({ status: "ok", duplicate: true });
     }
 
     event.timings = timing;
+    event.replyTurn = context.replyTurn;
+    event.learningConversation = true;
     event.lifeContactToken = context.contactToken;
     event.lifeContactEvidence = context.contactEvidence;
-    const admission = shouldRespondToQq(event);
+    event.memoryEpochToken = context.memoryEpochToken;
+    event.lifeIncomingTokens = context.lifeIncomingTokens || [];
+    if (event.memoryEpochToken && !await unifiedMemory.isEpochCurrent(event.memoryEpochToken)) {
+      await lifeContacts?.cancelIncoming(event.lifeIncomingTokens);
+      return { status: 'ok', ignored: true, reason: 'memory-epoch-changed' };
+    }
+    const admission = shouldRespondToPrivate(event);
     const contactCurrent = !admission.ok || isCurrentLifeReply(event);
     if (!admission.ok || !contactCurrent) {
       const record = { id: crypto.randomUUID(), receivedAt: new Date(timing.receivedAt).toISOString(),
-        source: 'onebot', event, decision: { ...admission, ok: false, status: '忽略',
+        source: 'pwa', event, decision: { ...admission, ok: false, status: '忽略',
           ...(!contactCurrent ? { reason: 'contact-epoch-superseded' } : {}) }, timings: timing,
         completedAt: new Date().toISOString(), reply: null, send: null, error: null };
-      state.qq.events.unshift(record); state.qq.events = state.qq.events.slice(0, 30);
+      state.privateChat.events.unshift(record); state.privateChat.events = state.privateChat.events.slice(0, 30);
       await saveReplyTiming(record);
       return { status: 'ok', ignored: true };
     }
-    if (lifeReplies && !/^\s*\//.test(event.text || '')) {
-      await lifeTimeline.tick();
+    if (lifeAvailable() && lifeReplies && event.backendCommand !== true) {
+      try { await lifeTimeline.tick(); } catch (error) { suspendLife(error, { retryable: true }); }
       pumpLifeConversation();
-      const disposition = await lifeReplies.receive(event);
+      const disposition = lifeAvailable() ? await lifeReplies.receive(event).catch(error => { suspendLife(error); return { handled: false }; }) : { handled: false };
       if (disposition.handled) {
         const record = { id: crypto.randomUUID(), receivedAt: new Date(timing.receivedAt).toISOString(),
-          source: 'onebot', event, decision: { ok: true, status: '生活消息已接收', reason: disposition.kind },
+          source: 'pwa', event, decision: { ok: true, status: '生活消息已接收', reason: disposition.kind },
           timings: timing, completedAt: new Date().toISOString(), reply: null, send: null, error: null };
-        state.qq.events.unshift(record); state.qq.events = state.qq.events.slice(0, 30);
+        state.privateChat.events.unshift(record); state.privateChat.events = state.privateChat.events.slice(0, 30);
         await saveReplyTiming(record);
         return { status: 'ok', life: disposition.kind };
       }
     }
-    event.lifeReplyTicket = !/^\s*\//.test(event.text || '') ? lifeConversation?.beginReply(event) : undefined;
+    event.lifeReplyTicket = lifeAvailable() && event.backendCommand !== true ? lifeConversation?.beginReply(event) : undefined;
     try {
     await measurePreparation(timing, async () => {
-      event = recentImages.attach(await attachReplyContext(event));
+      event = await attachReplyContext(event);
     });
-    const decision = shouldRespondToQq(event);
+    const decision = shouldRespondToPrivate(event);
     const record = { id: crypto.randomUUID(), receivedAt: new Date(timing.receivedAt).toISOString(),
-      source: 'onebot', event, decision, timings: timing, reply: null, error: null, send: null };
+      source: 'pwa', event, decision, timings: timing, reply: null, error: null, send: null };
     if (decision.ok) record.decision.status = '生成中';
-    state.qq.events.unshift(record); state.qq.events = state.qq.events.slice(0, 30);
+    state.privateChat.events.unshift(record); state.privateChat.events = state.privateChat.events.slice(0, 30);
     let reply = null;
     let error = null;
     let commandAction = null;
     let modelReply = false;
     if (decision.ok) {
       try {
-        commandAction = buildQqCommandAction(event);
+        commandAction = buildPrivateCommandAction(event);
         reply = await measurePreparation(timing, async () => {
           const prepared = decision.reply || await hubCommands.handle(event) || await privateTasks.handle(event) || commandAction?.reply || buildBoundaryReply(event);
           if (prepared) return prepared;
+          if (!/^\s*\//.test(event.text || '')) event.replyTurn?.enableReplacement();
+          throwIfReplySuperseded(event);
           const generated = await buildModelReply(event);
           modelReply = true;
           return generated;
         });
       } catch (caught) {
+        if (caught.code === 'MEMORY_EPOCH_CHANGED') {
+          record.reply = null;
+          record.decision.status = '已取消';
+          record.decision.reason = 'memory-epoch-changed';
+          record.completedAt = new Date().toISOString();
+          await lifeContacts?.cancelIncoming(event.lifeIncomingTokens);
+          await saveReplyTiming(record);
+          return { status: 'ok', ignored: true, reason: 'memory-epoch-changed' };
+        }
+        if (caught.code === 'REPLY_SUPERSEDED' || event.replyTurn?.signal.aborted) {
+          discardCancelledWork(event, 'reply-superseded');
+          record.decision.status = '已合并新消息';
+          record.decision.reason = 'reply-superseded';
+          record.completedAt = new Date().toISOString();
+          await saveReplyTiming(record);
+          return { status: 'ok', superseded: true };
+        }
         error = publicFailure(caught);
-        reply = caught.code === 'RUNTIME_BUDGET_BLOCKED' ? error : `${pickActionBeat(event)}这边刚刚卡了一下，等我再试一次。`;
+        reply = caught.code === 'RUNTIME_BUDGET_BLOCKED' ? error : `这边刚刚卡了一下，等我再试一次。`;
       }
     }
     Object.assign(record, { reply, error });
+    if (event.replyTurn?.signal.aborted) {
+      record.reply = null;
+      record.decision.status = '已合并新消息';
+      record.decision.reason = 'reply-superseded';
+      record.completedAt = new Date().toISOString();
+      await saveReplyTiming(record);
+      return { status: 'ok', superseded: true };
+    }
     if (error && event.isOwner && event.type === 'private_message') record.reply = error;
     if (record.reply) record.decision.status = '发送中';
     if (record.reply && event.type === "private_message") {
+      event.pwaSkipMemory = Boolean(error) || event.skipExchangeMemory === true;
       try {
-        record.send = await measureSend(timing, () => sendOneBotPrivateReply(event, record.reply,
+        record.send = await measureSend(timing, () => sendPrivateReply(event, record.reply,
           { splitText: modelReply && !error && !/^\s*\//.test(event.text || '') }));
+        if (event.retrievalFallbackText) record.reply = event.retrievalFallbackText;
       } catch (error) {
-        record.send = { ok: false, error: error.message };
+        record.send = { ok: false, uncertain: event.lifeDeliveryUncertain === true, error: error.message };
       }
+    }
+    // HTTP acceptance advances the durable generation before its asynchronous
+    // contact projection reaches MessageBatches. If that barrier rejects an
+    // entirely unpublished draft, retain its inputs for the newer PWA batch.
+    // A changed identity/route, a command, or any published prefix is terminal;
+    // none may be silently replayed as a fresh conversation.
+    const unpublishedPwaReplacement = isPwaEvent(event) && event.backendCommand !== true
+      && !event.sentMessageIds?.length
+      && ['new-input-accepted', 'pwa-route-or-input-changed', 'delivery-stale', 'intake-pending'].includes(record.send?.reason)
+      && pwaIdentityCurrent(event, pwaStore)
+      && pwaStore.hasNewerPendingInbox({ userId: event.privateIdentity.userId,
+        routeVersion: event.privateIdentity.routeVersion, generation: event.privateIdentity.generation });
+    if (record.send?.reason === 'reply-superseded' || unpublishedPwaReplacement) {
+      record.reply = null;
+      record.decision.status = '已合并新消息';
+      record.decision.reason = unpublishedPwaReplacement ? 'pwa-input-replaced-before-delivery' : 'reply-superseded';
+      record.completedAt = new Date().toISOString();
+      await saveReplyTiming(record);
+      return { status: 'ok', superseded: true };
     }
     // A delivered prefix is the only reply that actually happened if a later
     // bubble failed or was superseded. Never remember unsent continuation text.
@@ -5781,16 +6264,12 @@ async function processTimedOneBotEvent(payload, timing, context) {
       record.reply = record.send.deliveredText;
     }
     if (record.send?.reason === 'life-choice-replaced' && !event.lifeTransportStarted
-      && !event.sentMessageIds?.length && isCurrentLifeReply(event)) {
+      && !event.sentMessageIds?.length && isCurrentLifeReply(event) && lifeAvailable() && lifeReplies) {
       event.queueDisposition = await lifeReplies.defer(event);
       record.decision.reason = 'activity-transition-deferred';
     }
     if (record.reply && record.send?.ok !== false && commandAction?.afterSend) await commandAction.afterSend();
-    if (record.reply && record.send?.ok === true && !error) {
-      await moodState.commit(event).catch(() => console.error('Could not save QQ mood state'));
-      try { await rememberQqExchange(event, record.reply); }
-      catch { record.memorySaved = false; console.error('Could not save delivered private exchange'); }
-    }
+    if (isPwaEvent(event)) { pwaActiveLogical.delete(event.pwaLogicalReplyId); await flushPwaProjections(); }
     if (record.reply || error) {
       record.decision.status = error || !record.send?.ok ? '回复失败' : record.send.textComplete === false ? '部分已回复' : '已回复';
       record.completedAt = new Date().toISOString();
@@ -5802,5 +6281,8 @@ async function processTimedOneBotEvent(payload, timing, context) {
       await saveReplyTiming(record);
     }
     return ({ status: "ok" });
-    } finally { lifeConversation?.endReply(event.lifeReplyTicket); }
+    } finally {
+      pwaActiveLogical.delete(event.pwaLogicalReplyId);
+      lifeConversation?.endReply(event.lifeReplyTicket);
+    }
 }

@@ -1,22 +1,17 @@
-# 运行数据、迁移副本与临时写入：仅放行说明文件
-data/*
-!data/README.md
-!data/qq-stickers/
-data/qq-stickers/*
-!data/qq-stickers/README.md
-
-runtime/
-tmp/
-napcat-data/
-workspaces/remote/
-deploy/zhiwei.service
-deploy/zhiwei.env
-.codex/
+# Instance settings, accounts, conversations, media and generated content
+/data/
+/runtime/
+/tmp/
+/workspaces/
+/napcat-data/
+/.codex/
 .env
 .env.*
 !.env.example
-
+/deploy/zhiwei.env
 node_modules/
+__pycache__/
+*.pyc
 *.log
 *.pid
 .DS_Store

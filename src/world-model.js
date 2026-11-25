@@ -8,11 +8,12 @@ export const worldDecisionSchema = {
   properties: {
     action: { type: 'string', enum: ['rest', 'search', 'follow', 'note'] },
     query: { type: ['string', 'null'] },
+    platform: { type: 'string', enum: ['web', 'x', 'xiaohongshu'] },
     linkIndex: { type: ['integer', 'null'] },
     summary: { type: ['string', 'null'] },
     comment: { type: ['string', 'null'] }
   },
-  required: ['action', 'query', 'linkIndex', 'summary', 'comment']
+  required: ['action', 'query', 'platform', 'linkIndex', 'summary', 'comment']
 };
 
 // Disable supported capability groups explicitly. unified_exec=false is not a
@@ -33,6 +34,8 @@ export const worldModelConfig = Object.freeze({
   'features.computer_use': false,
   'features.in_app_browser': false,
   'features.image_generation': false,
+  'features.view_image': false,
+  'tools.experimental_request_user_input.enabled': false,
   'features.hooks': false,
   'features.code_mode.enabled': false,
   'features.code_mode_host': false,
@@ -91,11 +94,25 @@ export function parseWorldUsage(value) {
   return Object.fromEntries(keys.map(key => [key, value[key]]));
 }
 
-function invoke({ command, args, cwd, env, prompt, timeoutMs }) {
+function invoke({ command, args, cwd, env, prompt, timeoutMs, signal }) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let buffer = '', text = '', usage = null, completed = false, failure = null, bytes = 0;
-    const fail = message => { failure ||= Error(message); child.kill(); };
+    if (signal?.aborted) { reject(Error('模型任务已取消')); return; }
+    const grouped = process.platform !== 'win32';
+    const child = spawn(command, args, { cwd, env, detached: grouped, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let buffer = '', text = '', usage = null, completed = false, failure = null, bytes = 0, closed = false;
+    let terminateTimer;
+    const stop = signalName => {
+      try { if (grouped && child.pid > 0) process.kill(-child.pid, signalName); else child.kill(signalName); }
+      catch (error) { if (error.code !== 'ESRCH') { try { child.kill(signalName); } catch {} } }
+    };
+    const fail = message => {
+      failure ||= Error(message); if (closed) return;
+      stop('SIGTERM');
+      terminateTimer ||= setTimeout(() => stop('SIGKILL'), 1000);
+      terminateTimer.unref();
+    };
+    const abort = () => fail('模型任务已取消');
+    signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => fail('阅读模型调用超时'), timeoutMs);
     const line = raw => {
       if (!raw.trim() || failure) return;
@@ -129,9 +146,12 @@ function invoke({ command, args, cwd, env, prompt, timeoutMs }) {
     });
     // Drain diagnostics without storing prompts, credentials or model content.
     child.stderr.on('data', () => {});
-    child.on('error', error => { clearTimeout(timer); reject(Object.assign(Error('无法启动阅读模型'), { code: error.code })); });
+    child.on('error', error => { clearTimeout(timer); clearTimeout(terminateTimer); signal?.removeEventListener('abort', abort); reject(Object.assign(Error('无法启动阅读模型'), { code: error.code })); });
     child.on('close', code => {
+      closed = true;
+      if (grouped) stop('SIGKILL');
       clearTimeout(timer);
+      clearTimeout(terminateTimer); signal?.removeEventListener('abort', abort);
       if (buffer.trim()) line(buffer);
       if (failure) return reject(Object.assign(failure, { usage }));
       if (code !== 0 || !completed) return reject(Object.assign(Error(`阅读模型未正常完成（退出码 ${code}）`), { usage }));
@@ -153,7 +173,8 @@ export function createWorldModel({ directory, model = 'gpt-6.1-sol', reasoningEf
   if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(reasoningEffort)) throw Error('阅读模型推理等级无效');
   if (!schema || schema.type !== 'object') throw Error('阅读模型需要JSON对象schema');
   const root = resolve(directory);
-  return async ({ prompt, imagePaths = [] } = {}) => {
+  return async ({ prompt, imagePaths = [], signal } = {}) => {
+    if (signal?.aborted) throw Error('模型任务已取消');
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 200000) throw Error('阅读模型输入为空或过长');
     if (!Array.isArray(imagePaths) || imagePaths.length > 8 || imagePaths.some(path => typeof path !== 'string' || !isAbsolute(path))) throw Error('阅读模型图片路径无效');
     await mkdir(root, { recursive: true });
@@ -164,7 +185,7 @@ export function createWorldModel({ directory, model = 'gpt-6.1-sol', reasoningEf
       const args = buildWorldModelArgs({ cwd, schemaPath, model, reasoningEffort, imagePaths });
       const invocation = codexCommand(codexPath || resolveCodex(), args);
       return await invoke({ ...invocation, cwd, env: worldModelEnvironment(process.env, proxy), prompt,
-        timeoutMs: Math.max(100, Math.min(300000, timeoutMs)) });
+        timeoutMs: Math.max(100, Math.min(300000, timeoutMs)), signal });
     } finally {
       const childPath = relative(root, cwd);
       if (!childPath || childPath.startsWith('..' + sep) || isAbsolute(childPath)) throw Error('阅读模型临时目录超出范围');

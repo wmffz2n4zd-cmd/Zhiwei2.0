@@ -2,6 +2,10 @@
 
 Release-level changes only. The upstream project's per-session engineering log is not distributed with this release.
 
+## v2.03
+
+The public interface moved from QQ to an invitation-only web app. This release includes multi-image conversations, a shared members' space, private thoughts, public-page reading and creative tools with downloadable results. The optional isolated browser lets Zhiwei test and revise the pages she writes. [Release notes](docs/release-v2.03.md) · [Install](docs/en/install.md)
+
 ## 2.0.0
 
 First release packaged for public deployment. Target platform Ubuntu 24.04 x86_64. Licensed under **MIT** (see `LICENSE`).

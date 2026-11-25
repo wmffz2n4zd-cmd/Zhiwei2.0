@@ -2,6 +2,8 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { mkdir, lstat, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, resolve, sep } from 'node:path';
+import { inspectXStatus } from './x-status.js';
+import { isRetiredSearchUrl } from './search-destinations.js';
 
 const LOGIN_URLS = Object.freeze({
   x: 'https://x.com/i/flow/login',
@@ -17,7 +19,35 @@ const WRITE_OPERATION = /\/(?:Create|Delete|Update|Destroy|Favorite|Unfavorite|B
 const PRIVATE_DOM_SELECTOR = 'input,textarea,select,option,form,[contenteditable],script,style,noscript,template,[hidden],[aria-hidden="true"],[data-private],[autocomplete]';
 const DISALLOWED_RESOURCE_TYPES = new Set(['websocket', 'eventsource', 'manifest', 'other']);
 const EMPTY = () => ({ url: '', title: '', text: '', links: [], imagePaths: [], requiresLogin: false });
+export function retiredSearchObservation(input) {
+  if (!isRetiredSearchUrl(input)) return null;
+  const url = new URL(input);
+  return { ...EMPTY(), url: url.origin + url.pathname, blockedReason: 'search_source_retired' };
+}
 const X_BROWSER_HOSTS = new Set(['x.com', 'www.x.com', 'mobile.x.com', 'twitter.com', 'www.twitter.com', 'mobile.twitter.com']);
+const XHS_CONTENT_HOSTS = new Set(['xiaohongshu.com', 'www.xiaohongshu.com']);
+// S126 observed these exact search requests in the site's own search document.
+// History sync, telemetry, account actions and generic POST remain excluded.
+export const XHS_READ_SEARCH_POST_ENDPOINTS = Object.freeze([
+  'https://so.xiaohongshu.com/api/sns/web/v2/search/notes',
+  'https://edith.xiaohongshu.com/api/sns/web/v1/search/onebox'
+]);
+export function xhsContentTarget(input) {
+  try {
+    const url = new URL(input);
+    if (url.protocol !== 'https:' || url.username || url.password || !XHS_CONTENT_HOSTS.has(url.hostname.toLowerCase()) || url.port) return null;
+    if ([...url.searchParams.keys()].some(key => SENSITIVE_QUERY.test(key) || ACTION_QUERY.test(key))) return null;
+    if (/^\/search_result\/?$/.test(url.pathname) && url.searchParams.get('keyword')?.trim()) return { kind: 'search', noteId: null };
+    const note = /^\/(?:explore|discovery\/item|search_result)\/([a-zA-Z0-9_-]+)\/?$/.exec(url.pathname);
+    return note ? { kind: 'note', noteId: note[1] } : null;
+  } catch { return null; }
+}
+
+// Accept older callers' platform hints while keeping one actual search destination.
+export function keywordSearchPlatform(platform = 'xiaohongshu') {
+  if (!['xiaohongshu', 'xhs', 'web', 'x', 'twitter'].includes(platform)) throw failure('搜索平台只支持小红书及兼容的旧参数。');
+  return 'xiaohongshu';
+}
 
 export function isXBrowserUrl(input) {
   try { return X_BROWSER_HOSTS.has(new URL(input).hostname.toLowerCase().replace(/\.$/, '')); } catch { return false; }
@@ -29,7 +59,7 @@ function isXAuthenticationUrl(input) {
 function xContentTarget(input) {
   if (!isXBrowserUrl(input)) return null;
   const path = new URL(input).pathname;
-  const status = /^\/[^/]+\/status\/(\d+)(?:\/|$)/.exec(path);
+  const status = /^\/(?:[^/]+|i\/web)\/status\/(\d+)(?:\/|$)/.exec(path);
   return status ? { statusId: status[1] } : /^\/(?:home|search)?\/?$/.test(path) ? { statusId: null } : null;
 }
 
@@ -63,6 +93,53 @@ export function inspectXReadiness({ statusId = null } = {}) {
     if (hasStatus && (hasText || hasMedia)) return 'ready';
   }
   return false;
+}
+
+// Rendered content only: no form values, cookies, local storage or response body.
+// A search navigation shell or an error followed by an empty-state label is not
+// proof of an empty successful search, and cannot become a reading experience.
+export function inspectXhsReadiness({ kind = 'search', noteId = null } = {}) {
+  const visible = node => {
+    if (!node || !node.getClientRects().length || node.closest('[hidden],[aria-hidden="true"]')) return false;
+    for (let parent = node; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0') return false;
+    }
+    return true;
+  };
+  const bodyText = document.body?.innerText || '';
+  if ([...document.querySelectorAll('iframe[src*="captcha"],iframe[src*="challenge"],[id*="captcha"],[class*="captcha"]')].some(visible)
+    || /(?:安全验证|访问过于频繁|完成验证|拖动滑块|人机验证|验证后继续)/i.test(bodyText)) return 'human_verification_required';
+  if ([...document.querySelectorAll('input[type="password"],input[autocomplete="current-password"]')].some(visible)
+    || /(?:登录后(?:查看|浏览|继续)|登录(?:即可|以)(?:查看|继续)|请先登录|扫码登录|账号密码登录)/i.test(bodyText)) return 'login_required';
+  const failed = /(?:搜索失败|加载失败|网络异常|请求失败|系统繁忙|出错了|服务器错误)/.test(bodyText);
+  const media = node => [...node.querySelectorAll('img,video')].some(item => visible(item)
+    && (item.tagName === 'VIDEO' ? item.readyState >= 2 : item.complete && item.naturalWidth >= 80 && item.naturalHeight >= 80)
+    && !/avatar|profile|logo|icon|qr.?code|captcha/i.test(`${item.className} ${item.alt || ''}`));
+  if (kind === 'note') {
+    // Require the opened note's detail surface rather than recommendations.
+    if (!noteId || !location.pathname.includes('/' + noteId)) return false;
+    const ready = [...document.querySelectorAll('.note-content,.note-detail,.note-container,#noteContainer,.note-scroller')]
+      .some(node => visible(node) && ([...node.querySelectorAll('#detail-title,#detail-desc,.note-text,.desc,.title')]
+        .some(text => visible(text) && text.textContent.trim()) || media(node)));
+    return ready ? 'ready' : failed ? 'xhs_read_failed' : false;
+  }
+  for (const link of document.querySelectorAll('a[href]')) {
+    if (!visible(link)) continue;
+    let target;
+    try { target = new URL(link.href); } catch { continue; }
+    if (target.protocol !== 'https:' || target.username || target.password || target.port
+      || [...target.searchParams.keys()].some(key => /^(?:password|passwd|secret|token|access_token|refresh_token|auth|authorization|session|sessionid|cookie|csrf|xsrf|action|do|cmd|command|operation|method|_method)$/i.test(key))
+      || !['xiaohongshu.com', 'www.xiaohongshu.com'].includes(target.hostname.toLowerCase())
+      || !/^\/(?:explore|discovery\/item|search_result)\/[a-zA-Z0-9_-]+\/?$/.test(target.pathname)) continue;
+    const card = link.closest('.note-item,.feed-card,section,article') || link;
+    if (visible(card) && (card.innerText?.trim() || media(card))) return 'ready';
+  }
+  if (failed) return 'xhs_read_failed';
+  const empty = [...document.querySelectorAll('.empty-container,.empty-result,.empty-state,.no-result,.no-results,.empty-box,.search-empty,.search-empty-container')]
+    .some(node => visible(node) && node.closest('.search-layout,.search-result-container,.search-result,.search-content,main,[role="main"]')
+      && /^(?:暂无(?:相关)?(?:笔记|搜索结果|结果)|(?:未(?:能)?|(?:暂时|还)?没有|未能为你)(?:搜到|找到)(?:相关的?|符合条件的)?(?:笔记|内容|结果))[。！!]?$/u.test(node.innerText?.trim()));
+  return empty ? 'empty' : false;
 }
 
 function failure(message) { const error = new Error(message); error.name = 'BrowserReadPolicyError'; return error; }
@@ -133,10 +210,12 @@ export async function validatePublicUrl(input, { lookup = dnsLookup, allowAccoun
   return url.href;
 }
 
-export function checkReadRequest(input, { method = 'GET', resourceType = 'document', readonlyPostEndpoints = [] } = {}) {
+export function checkReadRequest(input, { method = 'GET', resourceType = 'document', readonlyPostEndpoints = [], documentUrl } = {}) {
   const parsed = parsePublicUrl(input);
   const verb = String(method).toUpperCase();
-  const allowedPost = parsed.url.protocol === 'https:' && !parsed.url.search && readonlyPostEndpoints.includes(parsed.url.origin + parsed.url.pathname);
+  const endpoint = parsed.url.origin + parsed.url.pathname;
+  const siteSearch = xhsContentTarget(documentUrl)?.kind === 'search' && XHS_READ_SEARCH_POST_ENDPOINTS.includes(endpoint);
+  const allowedPost = parsed.url.protocol === 'https:' && !parsed.url.search && (readonlyPostEndpoints.includes(endpoint) || siteSearch);
   if (verb === 'OPTIONS' && allowedPost) return parsed.url.href;
   if (DISALLOWED_RESOURCE_TYPES.has(resourceType)) throw failure('只读模式禁止此类后台连接。');
   if (verb === 'GET' || verb === 'HEAD') return parsed.url.href;
@@ -157,22 +236,33 @@ export function extractVisibleDocument({ maxTextChars = 18000, maxLinks = 40 } =
     }
     return true;
   };
-  const chunks = [];
-  let length = 0;
-  if (document.body) {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode() && length < maxTextChars) {
+  const visibleText = (root, limit) => {
+    if (!root) return '';
+    const chunks = [], walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let length = 0;
+    while (walker.nextNode() && length < limit) {
       const node = walker.currentNode;
       if (!visible(node.parentElement)) continue;
       const text = node.textContent.replace(/\s+/g, ' ').trim();
       if (text) { chunks.push(text); length += text.length + 1; }
     }
-  }
+    return chunks.join('\n').slice(0, limit);
+  };
   const links = [];
-  for (const node of document.querySelectorAll('a[href]')) {
+  const isXhs = typeof location !== 'undefined' && ['xiaohongshu.com', 'www.xiaohongshu.com'].includes(location.hostname.toLowerCase());
+  const noteLink = node => {
+    try { const target = new URL(node.href); return target.protocol === 'https:' && !target.username && !target.password && !target.port
+      && ![...target.searchParams.keys()].some(key => /^(?:password|passwd|secret|token|access_token|refresh_token|auth|authorization|session|sessionid|cookie|csrf|xsrf|action|do|cmd|command|operation|method|_method)$/i.test(key))
+      && ['xiaohongshu.com', 'www.xiaohongshu.com'].includes(target.hostname.toLowerCase())
+      && /^\/(?:explore|discovery\/item|search_result)\/[a-zA-Z0-9_-]+\/?$/.test(target.pathname); } catch { return false; }
+  };
+  const anchors = [...document.querySelectorAll('a[href]')];
+  if (isXhs) anchors.sort((left, right) => Number(noteLink(right)) - Number(noteLink(left)));
+  for (const node of anchors) {
     if (links.length >= maxLinks) break;
     if (!visible(node) || node.hasAttribute('download')) continue;
-    const title = node.innerText?.trim().slice(0, 160);
+    const title = (node.innerText?.trim() || (isXhs && noteLink(node)
+      ? node.closest('.note-item,.feed-card,section,article')?.innerText?.trim() || node.querySelector('img')?.alt?.trim() || '小红书笔记' : '')).slice(0, 160);
     if (title) links.push({ title, url: node.href });
   }
   // Only inspect presence, never values. Password/login/challenge UI is not captured.
@@ -187,10 +277,22 @@ export function extractVisibleDocument({ maxTextChars = 18000, maxLinks = 40 } =
     const box = node.getBoundingClientRect();
     if (box.width >= 240 && box.height >= 160 && box.width <= 1800 && box.height <= 1800) images.push(index);
   }
-  return { title: document.title.slice(0, 240), text: chunks.join('\n').slice(0, maxTextChars), links, images, password, challenge };
+  // Only the visible note's own description can serve as a chat source. The
+  // full-page snapshot also contains recommendations, comments and navigation.
+  let noteDetail;
+  if (isXhs && /^\/(?:explore|discovery\/item|search_result)\/[a-zA-Z0-9_-]+\/?$/.test(location.pathname)) {
+    const desc = [...document.querySelectorAll('.note-content #detail-desc,.note-container #detail-desc,#noteContainer #detail-desc,.note-detail #detail-desc')]
+      .find(visible);
+    if (desc) {
+      const title = [...(desc.closest('.note-content,.note-detail,.note-container,#noteContainer')?.querySelectorAll('#detail-title') || [])].find(visible);
+      noteDetail = { title: visibleText(title, 240), text: visibleText(desc, 2400) };
+    }
+  }
+  return { title: document.title.slice(0, 240), text: visibleText(document.body, maxTextChars), links, images, password, challenge,
+    ...(noteDetail ? { noteDetail } : {}) };
 }
 
-export function sanitizePageSnapshot(snapshot, url, { maxTextChars = 18000, maxLinks = 40, xContentReady } = {}) {
+export function sanitizePageSnapshot(snapshot, url, { maxTextChars = 18000, maxLinks = 40, xContentReady, xhsContentReady, xhsReadFailed = false, xhsSearchEmpty = false } = {}) {
   const title = String(snapshot?.title || '').slice(0, 240);
   const text = String(snapshot?.text || '').slice(0, maxTextChars);
   const loginUrl = isXAuthenticationUrl(url) || /\/(?:login|signin|i\/flow\/login)(?:[/?]|$)/i.test(url);
@@ -215,7 +317,21 @@ export function sanitizePageSnapshot(snapshot, url, { maxTextChars = 18000, maxL
     result.text = 'X 页面尚未出现可读取的帖子内容；未将导航或加载页面当作正文。';
     result.links = [];
     result.blockedReason = 'x_content_not_ready';
-  } else if (text.trim().length < 30 && xContentReady !== true) result.blockedReason = 'no_readable_content';
+  } else if (xhsSearchEmpty && !xhsReadFailed && xhsContentTarget(url)?.kind === 'search'
+    && !links.some(link => xhsContentTarget(link.url)?.kind === 'note')) {
+    result.text = '小红书搜索结果显示没有相关笔记。';
+    result.links = [];
+    result.blockedReason = 'search_no_results';
+  } else if (xhsReadFailed || xhsContentReady === false
+    || xhsContentReady === true && xhsContentTarget(url)?.kind === 'search' && !links.some(entry => xhsContentTarget(entry.url)?.kind === 'note')) {
+    result.text = xhsReadFailed ? '小红书页面报告读取失败；未将错误后的空结果当作搜索成功。'
+      : '小红书页面尚未出现可读取的笔记内容；未将导航或加载页面当作正文。';
+    result.links = [];
+    result.blockedReason = xhsReadFailed ? 'xhs_read_failed' : 'xhs_content_not_ready';
+  } else if (text.trim().length < 30 && xContentReady !== true && xhsContentReady !== true) result.blockedReason = 'no_readable_content';
+  if (!result.blockedReason && xhsContentTarget(url)?.kind === 'note' && typeof snapshot?.noteDetail?.text === 'string' && snapshot.noteDetail.text.trim()) {
+    result.noteDetail = { title: String(snapshot.noteDetail.title || '').slice(0, 240), text: snapshot.noteDetail.text.trim().slice(0, 2400) };
+  }
   return result;
 }
 
@@ -344,8 +460,12 @@ export function createBrowserReader(options = {}) {
           if (context !== launchedContext) throw failure('浏览器已关闭。');
           if (nextMode === 'read') {
             if (++requestBudget > 350) throw failure('页面请求数量超过只读上限。');
-            if (request.isNavigationRequest() && page && request.frame() === page.mainFrame() && wrongProfile(request.url())) throw failure('browser_profile_boundary');
-            checkReadRequest(request.url(), { method: request.method(), resourceType: request.resourceType(), readonlyPostEndpoints });
+            if (request.isNavigationRequest() && page && request.frame() === page.mainFrame()) {
+              if (isRetiredSearchUrl(request.url())) throw failure('search_source_retired');
+              if (wrongProfile(request.url())) throw failure('browser_profile_boundary');
+            }
+            const documentUrl = page && request.frame() === page.mainFrame() ? page.url() : undefined;
+            checkReadRequest(request.url(), { method: request.method(), resourceType: request.resourceType(), readonlyPostEndpoints, documentUrl });
             if (request.isNavigationRequest() && page && request.frame() !== page.mainFrame()) throw failure('只读模式已阻止内嵌页面导航。');
           }
           await validatePublicUrl(request.url(), { lookup, allowAccountActions: nextMode === 'login' });
@@ -383,28 +503,77 @@ export function createBrowserReader(options = {}) {
     } catch (error) { await closeContext(); throw error; }
   }
 
-  async function readInternal(url) {
+  async function readInternal(url, { signal, captureImages = true, retryEmptyX = true } = {}) {
+    signal?.throwIfAborted();
     if (mode === 'login') throw failure('人工登录模式正在进行；请先结束登录再让知微读取网页。');
+    const retired = retiredSearchObservation(url);
+    if (retired) return retired;
     let validated;
     try { validated = await validatePublicUrl(url, { lookup }); } catch (error) { return { ...EMPTY(), requiresLogin: isXAuthenticationUrl(url), blockedReason: isXAuthenticationUrl(url) ? 'login_required' : error.message }; }
     if (wrongProfile(validated)) return { ...EMPTY(), blockedReason: 'browser_profile_boundary' };
+    signal?.throwIfAborted();
     await launch('read');
     lastBlockedReason = null;
     requestBudget = 0;
     // A fresh tab prevents data from a previous site remaining visible after a failed navigation.
     const previous = page;
-    page = null;
+    let readingTab, documentError = null;
+    const recordStatus = response => {
+      const status = response?.status();
+      if (status >= 400) {
+        const reason = status === 401 ? 'login_required' : [403, 407, 429].includes(status) ? 'http_access_restricted' : 'http_read_failed';
+        documentError = { ...EMPTY(), url: validated, requiresLogin: status === 401, blockedReason: reason };
+      }
+    };
+    const abort = () => { if (readingTab) void readingTab.close().catch(() => {}); };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
-      page = await context.newPage();
+      signal?.throwIfAborted();
+      page = null;
+      readingTab = page = await context.newPage();
       if (usablePage(previous)) await previous.close();
+      if (signal?.aborted) { abort(); signal.throwIfAborted(); }
       await context.setOffline(false);
-      await page.goto(validated, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+      // Chromium can emit the main document's HTTP response and then reject
+      // goto for an empty error body. Preserve the observed response in either case.
+      readingTab.on('response', response => {
+        const request = response.request();
+        if (request.isNavigationRequest() && request.frame() === readingTab.mainFrame()) recordStatus(response);
+      });
+      const requestedPost = xContentTarget(validated)?.statusId;
+      let detailDenied = null;
+      if (requestedPost) page.on('response', response => {
+        try {
+          const address = new URL(response.url());
+          if (!isXBrowserUrl(address.href) || !/\/(TweetDetail|TweetResultByRestId)$/.test(address.pathname)) return;
+          if (response.status() === 401) detailDenied = 'login_required';
+          if ([403, 429].includes(response.status())) detailDenied = 'http_access_restricted';
+        } catch { /* A non-URL response cannot establish the status of this post. */ }
+      });
+      recordStatus(await page.goto(validated, { waitUntil: 'domcontentloaded', timeout: timeoutMs }));
+      if (documentError) return documentError;
       await page.waitForLoadState('networkidle', { timeout: 3500 }).catch(() => {});
       const finalUrl = await validatePublicUrl(page.url(), { lookup });
+      const retiredRedirect = retiredSearchObservation(finalUrl);
+      if (retiredRedirect) return retiredRedirect;
       if (wrongProfile(finalUrl)) return { ...EMPTY(), blockedReason: 'browser_profile_boundary' };
       const target = xContentTarget(validated) || xContentTarget(finalUrl);
-      let readiness;
-      if (target) {
+      const xhsTarget = xhsContentTarget(finalUrl) || xhsContentTarget(validated);
+      let readiness, statusSnapshot;
+      if (target?.statusId) {
+        if (isXAuthenticationUrl(finalUrl)) return { ...EMPTY(), url:finalUrl, requiresLogin:true, blockedReason:'login_required' };
+        if (xContentTarget(finalUrl)?.statusId !== target.statusId) return { ...EMPTY(), url:finalUrl, blockedReason:'x_status_mismatch' };
+        try {
+          const handle = await page.waitForFunction(inspectXStatus, target, { polling:250, timeout:Math.min(timeoutMs, 15000) });
+          await handle.dispose();
+        } catch (error) { if (error.name !== 'TimeoutError') throw error; }
+        if (detailDenied) return { ...EMPTY(), url:finalUrl, requiresLogin:detailDenied === 'login_required', blockedReason:detailDenied };
+        statusSnapshot = await page.evaluate(inspectXStatus, {...target, mode:'snapshot', maxTextChars, maxLinks});
+        if (statusSnapshot?.reason === 'empty_shell' && retryEmptyX) {
+          return await readInternal(validated, {signal, captureImages, retryEmptyX:false});
+        }
+        readiness = statusSnapshot?.reason;
+      } else if (target) {
         try {
           const handle = await page.waitForFunction(inspectXReadiness, target, { polling: 100, timeout: Math.min(timeoutMs, 10000) });
           try { readiness = await handle.jsonValue(); } finally { await handle.dispose(); }
@@ -412,47 +581,82 @@ export function createBrowserReader(options = {}) {
         // Recheck at capture time in case the loaded tweet disappeared again.
         if (readiness === 'ready') readiness = await page.evaluate(inspectXReadiness, target);
       }
-      const snapshot = await page.evaluate(extractVisibleDocument, { maxTextChars, maxLinks });
-      if (readiness === 'login_required') snapshot.password = true;
-      if (readiness === 'human_verification_required') snapshot.challenge = true;
-      const result = sanitizePageSnapshot(snapshot, finalUrl, { maxTextChars, maxLinks, ...(target ? { xContentReady: readiness === 'ready' } : {}) });
-      if (!result.blockedReason) {
+      let xhsReadiness;
+      if (xhsTarget) {
+        try {
+          const handle = await page.waitForFunction(inspectXhsReadiness, xhsTarget, { polling: 100, timeout: Math.min(timeoutMs, 15000) });
+          try { xhsReadiness = await handle.jsonValue(); } finally { await handle.dispose(); }
+        } catch (error) { if (error.name !== 'TimeoutError') throw error; }
+        if (xhsReadiness === 'ready' || xhsReadiness === 'empty') xhsReadiness = await page.evaluate(inspectXhsReadiness, xhsTarget);
+      }
+      const snapshot = statusSnapshot ? {
+        title:'X 原帖 ' + target.statusId,
+        text:[statusSnapshot.text, ...(statusSnapshot.captions || [])].filter(Boolean).join('\n'),
+        links:statusSnapshot.links || [], images:[]
+      } : await page.evaluate(extractVisibleDocument, { maxTextChars, maxLinks });
+      if (readiness === 'login_required' || xhsReadiness === 'login_required') snapshot.password = true;
+      if (readiness === 'human_verification_required' || xhsReadiness === 'human_verification_required') snapshot.challenge = true;
+      const result = sanitizePageSnapshot(snapshot, finalUrl, { maxTextChars, maxLinks, ...(target ? { xContentReady: readiness === 'ready' } : {}),
+        ...(xhsTarget ? { xhsContentReady: xhsReadiness === 'ready', xhsReadFailed: xhsReadiness === 'xhs_read_failed', xhsSearchEmpty: xhsReadiness === 'empty' } : {}) });
+      if (statusSnapshot && !result.blockedReason) {
+        result.xStatus = {id:target.statusId, text:statusSnapshot.text, captions:statusSnapshot.captions};
+      }
+      if (!result.blockedReason && captureImages) {
         const saveScreenshot = async (name, png) => {
           const path = join(screenshotRoot, name);
           if ((await lstat(path).catch(error => { if (error.code === 'ENOENT') return null; throw error; }))?.isSymbolicLink()) throw failure('快照路径不能是符号链接。');
           await writeFile(path, png, { mode: 0o600, flag: 'w' });
           result.imagePaths.push(path);
         };
-        // Always use a fixed file name inside the configured directory. Mask form fields
-        // even if populated by a password manager or a user in the separate login session.
-        const png = await page.screenshot({ fullPage: false, type: 'png', animations: 'disabled', timeout: 5000, mask: [page.locator(PRIVATE_DOM_SELECTOR)], maskColor: '#242424' });
-        await saveScreenshot('page-1.png', png);
-        for (const [index, imageIndex] of (snapshot.images || []).slice(0, 2).entries()) {
-          if (!Number.isSafeInteger(imageIndex) || imageIndex < 0) continue;
-          try {
-            const image = page.locator('img').nth(imageIndex);
-            const png = await image.screenshot({ type: 'png', animations: 'disabled', timeout: 3000 });
-            await saveScreenshot(`image-${index + 1}.png`, png);
-          } catch { /* A lazy image disappearing must not discard readable text. */ }
+        if (statusSnapshot) {
+          for (let imageIndex = 0; imageIndex < statusSnapshot.imageCount; imageIndex++) {
+            const handle = await page.evaluateHandle(inspectXStatus, {...target, mode:'image', imageIndex});
+            try {
+              const photo = handle.asElement();
+              if (photo) await saveScreenshot(`image-${imageIndex + 1}.png`, await photo.screenshot({type:'png', animations:'disabled', timeout:3000}));
+            } catch { /* Detached original media does not invalidate the author's text. */ }
+            finally { await handle.dispose(); }
+          }
+        } else {
+          // Always use a fixed file name inside the configured directory. Mask form fields
+          // even if populated by a password manager or a user in the separate login session.
+          const png = await page.screenshot({ fullPage: false, type: 'png', animations: 'disabled', timeout: 5000, mask: [page.locator(PRIVATE_DOM_SELECTOR)], maskColor: '#242424' });
+          await saveScreenshot('page-1.png', png);
+          for (const [index, imageIndex] of (snapshot.images || []).slice(0, 2).entries()) {
+            if (!Number.isSafeInteger(imageIndex) || imageIndex < 0) continue;
+            try {
+              const image = page.locator('img').nth(imageIndex);
+              const png = await image.screenshot({ type: 'png', animations: 'disabled', timeout: 3000 });
+              await saveScreenshot(`image-${index + 1}.png`, png);
+            } catch { /* A lazy image disappearing must not discard readable text. */ }
+          }
         }
       }
+      if (statusSnapshot && !result.blockedReason && !result.text.trim() && !result.imagePaths.length) {
+        return { ...EMPTY(), url:finalUrl, blockedReason:'x_media_without_author_text' };
+      }
+      signal?.throwIfAborted();
       return result;
     } catch (error) {
+      signal?.throwIfAborted();
+      if (documentError) return documentError;
       const blockedReason = lastBlockedReason || (isXAuthenticationUrl(page?.url()) ? 'login_required' : error.name === 'BrowserReadPolicyError' ? error.message : '网页读取失败或超时；可能需要人工登录、验证码或站点不支持此读取方式。');
       return { ...EMPTY(), url: validated, requiresLogin: blockedReason === 'login_required', blockedReason };
-    } finally { if (context && mode === 'read') await context.setOffline(true).catch(() => {}); }
+    } finally {
+      signal?.removeEventListener('abort', abort);
+      if (context && mode === 'read') await context.setOffline(true).catch(() => {});
+    }
   }
 
   return Object.freeze({
     status,
     start: () => locked(async () => { if (mode === 'login') throw failure('请先结束人工登录模式。'); await launch('read'); return status(); }),
-    read: url => locked(() => readInternal(url)),
-    search: (query, { platform = 'web' } = {}) => locked(async () => {
+    read: (url, options) => locked(() => readInternal(url, options)),
+    search: (query, { platform, signal, captureImages } = {}) => locked(async () => {
       if (typeof query !== 'string' || !query.trim() || query.length > 500) throw failure('搜索词须为 1–500 个字符。');
+      keywordSearchPlatform(platform);
       const q = encodeURIComponent(query.trim());
-      const url = platform === 'x' || platform === 'twitter' ? `https://x.com/search?q=${q}&src=typed_query&f=live` : platform === 'xiaohongshu' || platform === 'xhs' ? `https://www.xiaohongshu.com/search_result?keyword=${q}&source=web_search_result_notes` : platform === 'web' ? `https://www.bing.com/search?q=${q}` : null;
-      if (!url) throw failure('不支持的搜索平台。');
-      return readInternal(url);
+      return readInternal(`https://www.xiaohongshu.com/search_result?keyword=${q}&source=web_search_result_notes`, { signal, captureImages });
     }),
     openLogin: platform => locked(async () => {
       const url = LOGIN_URLS[String(platform || '').toLowerCase()];

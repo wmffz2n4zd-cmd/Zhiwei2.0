@@ -1,6 +1,6 @@
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import { createBrowserReader, isXBrowserUrl } from './browser-reader.js';
+import { createBrowserReader, isXBrowserUrl, keywordSearchPlatform, retiredSearchObservation } from './browser-reader.js';
 
 // This exact read-only query was checked against X's published client bundle.
 // A query-id change must be rechecked, not broadened into a GraphQL wildcard.
@@ -76,15 +76,16 @@ export function createBrowserRouter({ defaultOptions, xOptions, browserFactory =
   return Object.freeze({
     status,
     start: () => locked(async () => { requireReadMode(); await (await choose(active || 'default')).start(); return status(); }),
-    read: url => locked(async () => {
+    read: (url, options) => locked(async () => {
       requireReadMode();
-      return (await choose(isXBrowserUrl(url) ? 'x' : 'default')).read(url);
+      const retired = retiredSearchObservation(url);
+      if (retired) return retired;
+      return (await choose(isXBrowserUrl(url) ? 'x' : 'default')).read(url, options);
     }),
     search: (query, searchOptions = {}) => locked(async () => {
       requireReadMode();
-      const platform = searchOptions.platform || 'web';
-      const key = platform === 'web' ? 'default' : platformKey(platform);
-      return (await choose(key)).search(query, searchOptions);
+      const platform = keywordSearchPlatform(searchOptions.platform);
+      return (await choose('default')).search(query, { ...searchOptions, platform });
     }),
     openLogin: platform => locked(async () => {
       const key = platformKey(platform);

@@ -1,14 +1,16 @@
 import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { hostname } from 'node:os';
+import { createImmutableArchive } from './immutable-archive.js';
+import { acquireFileLock } from './file-lock.js';
+import { createNoteSelector } from './note-recall.js';
 
 const boards = Object.freeze({ xiaohongshu: '小红书.md', x: 'X.md', other: '其他网站.md' });
 const labels = Object.freeze({ xiaohongshu: '小红书', x: 'X', other: '其他网站' });
 const aliases = new Map([['xiaohongshu', 'xiaohongshu'], ['小红书', 'xiaohongshu'], ['x', 'x'], ['X', 'x'], ['other', 'other'], ['其他网站', 'other']]);
 const queues = new Map();
 const maxRecords = 10000, maxBytes = 64 * 1024 * 1024;
-const inputKeys = new Set(['url', 'title', 'summary', 'comment', 'observedImages', 'sourceId']);
+const inputKeys = new Set(['url', 'title', 'summary', 'comment', 'observedImages', 'sourceId', 'memoryEpoch']);
 const trackingOrSecret = /^(?:utm_.+|fbclid|gclid|dclid|msclkid|igshid|xsec_token|xsec_source|access_token|refresh_token|id_token|token|auth|authorization|password|passwd|secret|api_key|apikey|session|sessionid|session_id|signature|sig|key)$/i;
 
 function textField(value, name, limit, optional = false) {
@@ -59,11 +61,12 @@ function normalizeInput(input) {
     summary: textField(input.summary, 'summary', 4000),
     comment: textField(input.comment, 'comment', 4000),
     observedImages: observedImages.map(value => textField(value, 'observedImages item', 1000)),
-    sourceId: textField(input.sourceId, 'sourceId', 200, true)
+    sourceId: textField(input.sourceId, 'sourceId', 200, true),
+    ...(input.memoryEpoch !== undefined ? { memoryEpoch: textField(input.memoryEpoch, 'memoryEpoch', 160) } : {})
   };
 }
 
-const recordId = url => createHash('sha256').update(url).digest('hex');
+const recordId = (url, epoch) => createHash('sha256').update(epoch == null ? url : `${url}\0${epoch}`).digest('hex');
 const displayTime = timestamp => new Intl.DateTimeFormat('zh-CN', {
   timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
@@ -123,103 +126,50 @@ async function atomicWrite(path, content) {
   }
 }
 
-async function readLockOwner(path) {
-  const info = await regularFile(path);
-  if (!info) return null;
-  if (info.size > 4096) return { unknown: true };
-  try {
-    const owner = JSON.parse(await readFile(path, 'utf8'));
-    if (!owner || owner.version !== 1 || !Number.isSafeInteger(owner.pid) || owner.pid < 1
-      || typeof owner.host !== 'string' || !owner.host || typeof owner.token !== 'string'
-      || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(owner.token)
-      || Object.keys(owner).some(key => !['version', 'pid', 'host', 'token'].includes(key))) return { unknown: true };
-    return owner;
-  } catch (error) { if (error.code === 'ENOENT') return null; if (error instanceof SyntaxError) return { unknown: true }; throw error; }
-}
-function ownerIsDead(owner) {
-  if (owner.host !== hostname()) return false;
-  try { process.kill(owner.pid, 0); return false; }
-  catch (error) { return error.code === 'ESRCH'; }
-}
-async function writeLockOwner(path, owner) {
-  const handle = await open(path, 'wx', 0o600);
-  try { await handle.writeFile(JSON.stringify(owner)); await handle.sync(); }
-  finally { await handle.close(); }
-}
-async function releaseOwnedLock(path, owner) {
-  const current = await readLockOwner(path);
-  if (!current || current.unknown || current.token !== owner.token || current.pid !== owner.pid || current.host !== owner.host) {
-    throw Error('Local board lock ownership changed; preserve the lock for inspection');
-  }
-  await unlink(path);
-}
 async function acquireBoardLock(path) {
-  const recoveryPath = path + '.recovering';
-  const wait = () => new Promise(done => setTimeout(done, 50));
-  let unknownReads = 0;
-  for (let attempt = 0; attempt < 200; attempt++) {
-    // A recovery fence surviving a crash must be inspected, never silently removed.
-    if (await regularFile(recoveryPath)) { await wait(); continue; }
-    const owner = { version: 1, pid: process.pid, host: hostname(), token: randomUUID() };
-    try {
-      await writeLockOwner(path, owner);
-      return () => releaseOwnedLock(path, owner);
-    } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const previous = await readLockOwner(path);
-    if (!previous) continue;
-    if (previous.unknown) {
-      // A competing creator may still be writing its owner record. Give that
-      // window a bounded chance to settle, but never infer that an empty lock is dead.
-      if (++unknownReads >= 5) throw Error('Local board lock owner is unknown or incomplete; preserve it and inspect after stopping writers');
-      await wait(); continue;
-    }
-    unknownReads = 0;
-    if (previous.host !== hostname()) throw Error('Local board lock belongs to another host; preserve it for inspection');
-    if (!ownerIsDead(previous)) { await wait(); continue; }
-    const recoveryOwner = { version: 1, pid: process.pid, host: hostname(), token: randomUUID() };
-    try { await writeLockOwner(recoveryPath, recoveryOwner); }
-    catch (error) { if (error.code === 'EEXIST') { await wait(); continue; } throw error; }
-    try {
-      const current = await readLockOwner(path);
-      if (current && !current.unknown && current.token === previous.token && current.pid === previous.pid
-        && current.host === previous.host && ownerIsDead(current)) {
-        await unlink(path);
-        // Acquire the new writer before releasing the recovery fence. A normal
-        // contender that raced the fence check can win, but it is never deleted.
-        try {
-          await writeLockOwner(path, owner);
-          return () => releaseOwnedLock(path, owner);
-        } catch (error) { if (error.code !== 'EEXIST') throw error; }
-      }
-    } finally { await releaseOwnedLock(recoveryPath, recoveryOwner); }
-  }
-  throw Error('Local boards are busy or a recovery lock remains; preserve locks and inspect after stopping writers');
+  return acquireFileLock(path, { timeoutMs: 10000, label: 'Local boards', legacyPaths: [path + '.recovering'] });
 }
 
-export function createLocalBoards({ directory, now = Date.now } = {}) {
+export function createLocalBoards({ directory, now = Date.now, retainedRecords = 600 } = {}) {
   if (typeof directory !== 'string' || !directory.trim() || directory.includes('\0')) throw new TypeError('A local board directory is required');
+  if (!Number.isSafeInteger(retainedRecords) || retainedRecords < 1 || retainedRecords > maxRecords) throw TypeError('Invalid board retention policy');
   if (typeof now !== 'function') throw new TypeError('now must be a function');
   const root = resolve(directory), lockPath = join(root, '.local-boards.lock');
   const queueKey = process.platform === 'win32' ? root.toLowerCase() : root;
   const files = Object.freeze({ ...Object.fromEntries(Object.entries(boards).map(([key, name]) => [key, join(root, name)])), records: join(root, 'records.json') });
 
+  let archive;
+  const emptyCounts = () => ({ xiaohongshu: 0, x: 0, other: 0 });
+  function validateRecord(record) {
+    const input = Object.fromEntries([...inputKeys].map(key => [key, record[key]]));
+    const normalized = normalizeInput(input);
+    if (record.url !== normalized.url || record.platform !== normalized.platform || record.id !== recordId(normalized.url, normalized.memoryEpoch)
+      || (record.memoryEpoch != null && record.memoryEpoch !== normalized.memoryEpoch)
+      || record.trust !== 'untrusted-web-content' || record.published !== false
+      || typeof record.recordedAt !== 'string' || new Date(record.recordedAt).toISOString() !== record.recordedAt) {
+      throw Error('Invalid local board record; original file preserved');
+    }
+    return record;
+  }
   async function load() {
     const info = await regularFile(files.records);
-    if (!info) return { version: 1, records: [] };
-    if (info.size > maxBytes) throw Error('Local board state is too large; original file preserved');
-    const data = JSON.parse(await readFile(files.records, 'utf8'));
-    if (data.version !== 1 || !Array.isArray(data.records) || data.records.length > maxRecords) throw Error('Invalid local board state; original file preserved');
-    const ids = new Set();
-    for (const record of data.records) {
-      const input = Object.fromEntries([...inputKeys].map(key => [key, record[key]]));
-      const normalized = normalizeInput(input);
-      if (record.url !== normalized.url || record.platform !== normalized.platform || record.id !== recordId(normalized.url)
-        || record.trust !== 'untrusted-web-content' || record.published !== false
-        || typeof record.recordedAt !== 'string' || new Date(record.recordedAt).toISOString() !== record.recordedAt || ids.has(record.id)) {
-        throw Error('Invalid local board record; original file preserved');
+    let data = { version: 2, records: [], archivedCounts: emptyCounts() };
+    if (info) {
+      if (info.size > maxBytes) throw Error('Local board state is too large; original file preserved');
+      data = JSON.parse(await readFile(files.records, 'utf8'));
+      if (![1, 2].includes(data.version) || !Array.isArray(data.records) || data.records.length > maxRecords + 1) throw Error('Invalid local board state; original file preserved');
+      const ids = new Set();
+      for (const record of data.records) {
+        validateRecord(record);
+        if (ids.has(record.id)) throw Error('Duplicate local board record');
+        ids.add(record.id);
       }
-      ids.add(record.id);
+      if (data.version === 2 && (!data.archivedCounts || Object.keys(data.archivedCounts).sort().join(',') !== Object.keys(boards).sort().join(',')
+        || Object.values(data.archivedCounts).some(count => !Number.isSafeInteger(count) || count < 0))) throw Error('Invalid local board archive counters');
+      data = { version: 2, records: data.records, archivedCounts: data.archivedCounts || emptyCounts() };
     }
+    archive = await createImmutableArchive(join(root, 'records-archive'), { minimumCount: Object.values(data.archivedCounts).reduce((sum, count) => sum + count, 0) });
+    if (!info && archive.count) throw Error('Local board state is missing committed archive metadata; original sources preserved');
     return data;
   }
 
@@ -230,13 +180,27 @@ export function createLocalBoards({ directory, now = Date.now } = {}) {
       const rootInfo = await lstat(root);
       if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw Error('Local board directory must not be a link');
       const releaseLock = await acquireBoardLock(lockPath);
-      try { return await action(await load()); }
+      try {
+        const data = await load();
+        releaseLock.assertHeld();
+        return await action(data);
+      }
       finally { await releaseLock(); }
     });
     const settled = task.catch(() => {});
     queues.set(queueKey, settled);
     settled.then(() => { if (queues.get(queueKey) === settled) queues.delete(queueKey); });
     return task;
+  }
+
+  async function maintain(data) {
+    let changed = false;
+    while (data.records.length > retainedRecords) {
+      const record = data.records[0];
+      await archive.put(record.id, record);
+      data.records.shift(); data.archivedCounts[record.platform]++; changed = true;
+    }
+    return changed;
   }
 
   async function persist(data, writeState) {
@@ -248,28 +212,30 @@ export function createLocalBoards({ directory, now = Date.now } = {}) {
       await atomicWrite(files.records, serialized);
     }
     // State is authoritative. initialize() or a repeated append repairs interrupted renders.
-    for (const platform of Object.keys(boards)) await atomicWrite(files[platform], renderBoard(platform, data.records));
+    for (const platform of Object.keys(boards)) await atomicWrite(files[platform], renderBoard(platform, data.records) + (data.archivedCounts[platform] ? `\n较早的 ${data.archivedCounts[platform]} 条原始记录保存在 records-archive/，仍参与去重且可通过读取接口访问。\n` : ''));
   }
 
   function describe(data) {
-    const counts = { xiaohongshu: 0, x: 0, other: 0 };
+    const counts = { ...data.archivedCounts };
     for (const record of data.records) counts[record.platform]++;
-    return { directory: root, files: { ...files }, counts, total: data.records.length, localOnly: true };
+    return { directory: root, files: { ...files }, counts, total: Object.values(counts).reduce((sum, count) => sum + count, 0), retained: data.records.length,
+      archived: Object.values(data.archivedCounts).reduce((sum, count) => sum + count, 0), localOnly: true };
   }
 
   return {
-    initialize() { return withStore(async data => { await persist(data, true); return describe(data); }); },
+    initialize() { return withStore(async data => { await maintain(data); await persist(data, true); return describe(data); }); },
     async append(input) {
-      const normalized = normalizeInput(input), id = recordId(normalized.url);
+      const normalized = normalizeInput(input), id = recordId(normalized.url, normalized.memoryEpoch);
       return withStore(async data => {
-        let record = data.records.find(item => item.id === id);
+        let record = data.records.find(item => item.id === id) || await archive.get(id);
+        if (record) validateRecord(record);
         const duplicate = !!record;
         if (!record) {
-          if (data.records.length >= maxRecords) throw Error('Local board capacity reached; existing records preserved');
           record = { id, ...normalized, recordedAt: new Date(now()).toISOString(), trust: 'untrusted-web-content', published: false };
           data.records.push(record);
         }
-        await persist(data, !duplicate);
+        const archived = await maintain(data);
+        await persist(data, !duplicate || archived);
         return { added: !duplicate, duplicate, record, boardPath: files[record.platform] };
       });
     },
@@ -277,7 +243,52 @@ export function createLocalBoards({ directory, now = Date.now } = {}) {
       const key = aliases.get(platform);
       if (!key) throw new TypeError('platform must be xiaohongshu, x, or other');
       if (!Number.isInteger(limit) || limit < 0 || limit > 200) throw new TypeError('limit must be an integer from 0 to 200');
-      return withStore(data => data.records.filter(record => record.platform === key).reverse().slice(0, limit));
+      return withStore(async data => {
+        const records = data.records.filter(record => record.platform === key).reverse().slice(0, limit);
+        if (records.length >= limit) return records;
+        // Older records stay on disk; only the requested bounded result is retained.
+        const old = [];
+        for await (const archived of archive.values()) {
+          validateRecord(archived);
+          if (archived.platform !== key || data.records.some(record => record.id === archived.id)) continue;
+          old.push(archived); old.sort((a, b) => b.recordedAt.localeCompare(a.recordedAt) || b.id.localeCompare(a.id));
+          if (old.length > limit - records.length) old.pop();
+        }
+        return [...records, ...old];
+      });
+    },
+    async recall({ query = '', at = now(), limit = 4, explore = false, recent = false, excludeText = '', memoryEpoch } = {}) {
+      if (memoryEpoch != null) textField(memoryEpoch, 'memoryEpoch', 160);
+      const selected = createNoteSelector({ query, at, limit, explore, recent, excludeText });
+      return withStore(async data => {
+        const hotIds = new Set(data.records.map(record => record.id)); let scanned = 0;
+        const consider = record => {
+          if (memoryEpoch == null ? record.memoryEpoch == null : record.memoryEpoch === memoryEpoch) selected.consider(record);
+        };
+        for (const record of data.records) {
+          consider(record); if (++scanned % 64 === 0) await new Promise(resolve => setImmediate(resolve));
+        }
+        for await (const record of archive.values()) {
+          validateRecord(record);
+          if (!hotIds.has(record.id)) consider(record);
+          // Full archive traversal remains cooperative without a date/count cutoff.
+          if (++scanned % 64 === 0) await new Promise(resolve => setImmediate(resolve));
+        }
+        return selected.results();
+      });
+    },
+    async resolve(ids) {
+      if (!Array.isArray(ids) || ids.length > 24 || ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))) throw TypeError('Invalid reading-note identities');
+      return withStore(async data => {
+        const result = [];
+        for (const id of new Set(ids)) {
+          const record = data.records.find(item => item.id === id) || await archive.get(id);
+          if (!record) continue;
+          validateRecord(record); if (record.id !== id) throw Error('Archived reading-note identity mismatch');
+          result.push(structuredClone(record));
+        }
+        return result;
+      });
     },
     status() { return withStore(data => describe(data)); }
   };
